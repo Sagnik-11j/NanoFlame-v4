@@ -1,0 +1,70 @@
+# ── Python ──────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual Environments ─────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+myenv/
+
+# ── Jupyter ──────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── PyTorch / Model Weights ──────────────────────────────
+*.pt
+*.pth
+*.bin
+*.ckpt
+*.safetensors
+*.tar
+*.gz
+
+# ── HuggingFace Cache ────────────────────────────────────
+.cache/
+~/.cache/huggingface/
+
+# ── Audio & Data Files ───────────────────────────────────
+*.wav
+*.mp3
+*.flac
+*.ogg
+data/
+datasets/
+
+# ── Training Outputs ─────────────────────────────────────
+outputs/
+runs/
+logs/
+checkpoints/
+wandb/
+lightning_logs/
+
+# ── Environment Variables / Secrets ─────────────────────
+.env
+.env.*
+*.secret
+
+# ── VS Code ──────────────────────────────────────────────
+.vscode/
+.vscode-server/
+
+# ── OS ───────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Misc ─────────────────────────────────────────────────
+*.log
+*.csv
+*.json
+tmp/
+temp/
