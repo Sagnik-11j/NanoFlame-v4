@@ -5,9 +5,12 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 import math
+import wave
+import warnings
 import pytest
 import torch
 import torchaudio
+import numpy as np
 import tempfile
 import os
 
@@ -17,21 +20,51 @@ sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from blocks.block1_audio_frontend import AudioFrontend, AudioFrontendOutput
 from config import N_MELS, CHUNK_FRAMES, SAMPLE_RATE, MAX_CHUNKS
 
+# Suppress torchaudio mel filterbank warning — expected with n_fft=400, n_mels=128
+warnings.filterwarnings("ignore", category=UserWarning, module="torchaudio")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HELPERS — generate synthetic .wav files in a temp directory
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_wav(duration_sec: float, sr: int = 16000, channels: int = 1) -> str:
-    """Create a temporary sine-wave .wav file. Returns its path."""
-    n_samples  = int(sr * duration_sec)
-    t          = torch.linspace(0, duration_sec, n_samples)
-    waveform   = torch.sin(2 * math.pi * 440 * t).unsqueeze(0)   # [1, N]
-    if channels == 2:
-        waveform = waveform.repeat(2, 1)                          # [2, N]
+    """
+    Write a WHITE NOISE .wav file using Python's built-in wave module.
 
+    White noise (not sine wave) is required because:
+    - A 440Hz sine only activates 1-2 of 128 mel bands.
+    - After normalisation, 126 silent bands cluster near the mean → std ≈ 0.06.
+    - White noise spreads energy across all 128 mel bands → std ≈ 1.0.
+
+    Uses wave stdlib (not torchaudio.save / soundfile) because:
+    - torchaudio 2.8 save/load requires torchcodec on Windows.
+    - soundfile.write misreads 1D arrays as [1, N_samples] channels on Windows.
+
+    seed=42 ensures fully reproducible chunks across test runs.
+    """
+    n_samples = int(sr * duration_sec)
+
+    rng      = np.random.default_rng(seed=42)
+    mono_f32 = rng.standard_normal(n_samples).astype(np.float32) * 0.3
+    mono_i16 = (mono_f32 * 32767).clip(-32768, 32767).astype(np.int16)
+
+    if channels == 1:
+        pcm_bytes = mono_i16.tobytes()
+    else:
+        stereo    = np.stack([mono_i16] * channels, axis=1)   # [N, C]
+        pcm_bytes = np.ascontiguousarray(stereo).tobytes()
+
+    # Close handle before wave opens — critical on Windows
     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-    torchaudio.save(tmp.name, waveform, sr)
+    tmp.close()
+
+    with wave.open(tmp.name, 'wb') as wf:
+        wf.setnchannels(channels)
+        wf.setsampwidth(2)      # 16-bit PCM
+        wf.setframerate(sr)
+        wf.writeframes(pcm_bytes)
+
     return tmp.name
 
 
@@ -42,7 +75,6 @@ def make_wav(duration_sec: float, sr: int = 16000, channels: int = 1) -> str:
 @pytest.fixture(scope="module")
 def frontend():
     return AudioFrontend()
-
 
 @pytest.fixture
 def wav_10s():
@@ -160,7 +192,6 @@ class TestNumerics:
             assert not torch.isinf(chunk).any(), "Inf detected in chunk"
 
     def test_normalised_roughly_unit(self, frontend, wav_30s):
-        # After per-spectrogram normalisation, std should be ~1
         out = frontend.process(wav_30s)
         for chunk in out.chunks:
             std = chunk.std().item()
@@ -171,7 +202,6 @@ class TestStackHelper:
     def test_stack_shape(self, frontend, wav_90s):
         out = frontend.process(wav_90s)
         stacked = out.stack()
-        # [N, 128, 1500]
         assert stacked.shape == (out.num_chunks, N_MELS, CHUNK_FRAMES)
 
 
