@@ -8,7 +8,7 @@ SAMPLE_RATE         = 16_000          # Hz  — Whisper's required input rate
 N_FFT               = 400             # samples  — 25ms window at 16kHz
 HOP_LENGTH          = 160             # samples  — 10ms hop at 16kHz
 N_MELS              = 128             # mel filterbank bands
-CHUNK_FRAMES        = 1500            # time-frames per 30s chunk (30s × 100 fps)
+CHUNK_FRAMES        = 3000            # time-frames per 30s chunk (30s × 100 fps)
 MAX_CHUNKS          = 10              # hard cap = 5 minutes of audio
 CHUNK_DURATION_SEC  = 30.0            # seconds per chunk
 FRAMES_PER_SEC      = 100             # = SAMPLE_RATE / HOP_LENGTH

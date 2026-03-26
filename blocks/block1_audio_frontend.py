@@ -156,7 +156,7 @@ class AudioFrontend:
             n_mels      = self.n_mels,
             window_fn   = torch.hann_window,   # Hann window prevents spectral leakage
             power       = 2.0,                 # output is power spectrum (not amplitude)
-            center      = True,                # pad edges so frame 0 is centred on t=0
+            center      = False,                # pad edges so frame 0 is centred on t=0
             pad_mode    = "reflect",
             norm        = "slaney",            # area-normalise mel filterbank triangles
             mel_scale   = "htk",               # HTK mel scale (same as Whisper)
