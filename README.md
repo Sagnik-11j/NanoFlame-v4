@@ -157,9 +157,8 @@ Both encoders output **1024-dim** — no dimension projection is needed.
 > Both Whisper-Medium and OpenBEATs-Large share the same 1024-dim output space — no projection step needed. Each Whisper token at time t carries both phonetic detail and sound/music awareness in the same 1024-dim vector.
 
 **Output dataclass:** `Block3Output` with fields `h_full`, `h_resampled`, `h_fused_chunks`, `n_chunks`, `seq_len`.  
-**Stage control methods:** `freeze_base_weights()` · `unfreeze_all()` · `enable_training_dropouts(p)`.  
+**Stage control methods:** `freeze()` · `unfreeze()` · `enable_training_dropouts(p)`.  
 **Multi-chunk API:** `b3.forward_multi_chunk(List[Tuple[h_ob, h_w]])` → concatenates N×750 tokens with learnable chunk-index positional encodings.
-
 ---
 
 ### Block 3 — Setup & Verification
