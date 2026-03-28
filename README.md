@@ -29,7 +29,6 @@ Audio → [Chunk] → [Whisper ║ OpenBEATs] → [Fuse] → [Adapt]
 | Perceiver Resampler | Learned queries | — | ~0.03 GB |
 | Cross-Attn Fusion + MLP Adaptor | Bridge layers | ~10M | ~0.08 GB |
 | QLoRA Adapters (r=16) | fp16 | ~25M | ~0.04 GB |
-| Block 2b Test | tests/test_block2b.py | Load weights + forward + grad check | — |
 | **Total** | | | **~2.09 GB ✅** |
 
 > ~3.91 GB of VRAM headroom on a 6 GB card.
@@ -121,6 +120,7 @@ LoRA r=16, α=32 applied from Stage 2 onward.
 - `blocks/beats_encoder.py` — ESPnet source file (do not modify)
 - `blocks/block2b_openbeats_encoder.py` — wrapper, stub injector, weight loader
 - `tests/test_block2b.py` — load + verify test
+- `tests/conftest.py` — prevents pytest from collecting standalone test scripts
 
 **Checkpoint:** Place `epoch_latest.pt` (~1.2 GB) from `shikhar7ssu/OpenBEATs-ICME` in `checkpoints/`.
 
@@ -155,6 +155,38 @@ Both encoders output **1024-dim** — no dimension projection is needed.
 | 3c | Long-audio chunk concat (if N > 1) + learnable chunk-index positional encodings | **`h_full [T × 1024]`** |
 
 > Both Whisper-Medium and OpenBEATs-Large share the same 1024-dim output space — no projection step needed. Each Whisper token at time t carries both phonetic detail and sound/music awareness in the same 1024-dim vector.
+
+**Output dataclass:** `Block3Output` with fields `h_full`, `h_resampled`, `h_fused_chunks`, `n_chunks`, `seq_len`.  
+**Stage control methods:** `freeze_base_weights()` · `unfreeze_all()` · `enable_training_dropouts(p)`.  
+**Multi-chunk API:** `b3.forward_multi_chunk(List[Tuple[h_ob, h_w]])` → concatenates N×750 tokens with learnable chunk-index positional encodings.
+
+---
+
+### Block 3 — Setup & Verification
+
+**Files:**
+- `blocks/block3_perceiver_fusion.py` — `PerceiverResampler`, `CrossAttentionFusion`, `ChunkConcat`, `Block3PerceiverFusion`, `Block3Output`
+- `tests/test_block3.py` — 9 unit tests (synthetic tensors) + 7 integration tests (real pipeline)
+- `tests/conftest.py` — tells pytest not to collect the standalone test scripts
+
+**No checkpoint required** for unit tests — Block 3 has no pretrained weights.  
+**Checkpoint required** for integration tests — needs `epoch_latest.pt` in `checkpoints/` (same file as Block 2b).
+
+**Run tests:**
+```bash
+# Unit tests only (fast, no checkpoint):
+python tests/test_block3.py --skip-integration
+
+# Full pipeline: Block1 → Block2a → Block2b → Block3:
+python tests/test_block3.py
+
+# GPU:
+python tests/test_block3.py --device cuda
+```
+
+**Unit tests cover:** PerceiverResampler shape + learned queries · CrossAttentionFusion seq-len preservation · ChunkConcat pos-enc differentiation · single chunk forward · 3-chunk forward · Qwen projection 1024→896 · gradient flow ≥80% · freeze/unfreeze/dropout cycle · Block3Output dataclass fields.
+
+**Integration tests cover:** Block1 mel shapes · Block2b h_ob shapes · Block2a h_w shapes · full 4-block chain (30s) · 3-chunk 90s pipeline · Qwen-ready 1024→896 projection · Stage-1 gradient isolation (Block2b frozen, Block3 trains).
 
 ---
 
@@ -364,7 +396,7 @@ Still within a single overnight+day run. The ~3.91 GB VRAM headroom allows batch
                              │
                              ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
-│  BLOCK 1 · AUDIO FRONTEND  [VERIFIED ✅ — 16/16 tests pass]              │
+│  BLOCK 1 · AUDIO FRONTEND                                                │
 ├──────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
 │  [1a] Load audio file                                                    │
@@ -614,7 +646,7 @@ Still within a single overnight+day run. The ~3.91 GB VRAM headroom allows batch
 | Block 1 — Audio Frontend | ✅ Complete | 16/16 passing |
 | Block 2a — Whisper-Medium Encoder | ✅ Complete | 26/26 |
 | Block 2b — OpenBEATs-Large Encoder | ✅ Complete | passed |
-| Block 3 — Perceiver Resampler + Fusion | 🔲 Pending | — |
+| Block 3 — Perceiver Resampler + Fusion | ✅ Complete | 16/16 (9 unit · 7 integration) |
 | Block 4 — MLP Adaptor | 🔲 Pending | — |
 | Block 5 — Text Tokenizer | 🔲 Pending | — |
 | Block 6 — Sequence Packing | 🔲 Pending | — |
