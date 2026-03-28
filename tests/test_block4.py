@@ -123,9 +123,10 @@ def make_fake_audio_file(path: Path, seconds: float = 30.0, sr: int = 16000):
 def mel_from_block1(AudioFrontend, tmp_audio_path: Path, device: str):
     af = AudioFrontend()
     out = af.process(tmp_audio_path)
+    if not out.chunks:
+        raise ValueError(f"AudioFrontend returned no chunks for {tmp_audio_path}")
     mel = out.chunks[0].unsqueeze(0).to(device)
     return mel, out
-
 
 def h_w_from_block2a(whisper_enc_or_cls, mel: torch.Tensor, device: str):
     B = mel.size(0)

@@ -383,7 +383,7 @@ class Block3PerceiverFusion(nn.Module):
     # ─── Forward: multi-chunk long audio ─────────────────────────────
     def forward_multi_chunk(
         self,
-        chunks: List[Tuple],
+        chunks: List[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
     ) -> Block3Output:
         """
         Multi-chunk forward for long-form audio (N > 1).
@@ -395,15 +395,20 @@ class Block3PerceiverFusion(nn.Module):
         Returns:
             Block3Output  — h_full: [B, N_w*N, 1024]
         """
+        if not chunks:
+            raise ValueError("chunks list cannot be empty")
+
         h_fused_list   = []
-        h_resampled_last = None
+        h_resampled_last: torch.Tensor
 
         for chunk in chunks:
             if len(chunk) == 3:
                 h_ob, h_w, ob_mask = chunk
-            else:
+            elif len(chunk) == 2:
                 h_ob, h_w = chunk
                 ob_mask = None
+            else:
+                raise ValueError(f"Expected tuple of length 2 or 3, got {len(chunk)}")
 
             h_fused, h_resampled = self._process_chunk(h_ob, h_w, ob_mask)
             h_fused_list.append(h_fused)
@@ -419,7 +424,6 @@ class Block3PerceiverFusion(nn.Module):
             n_chunks=len(chunks),
             seq_len=h_full.size(1),
         )
-
     # ─── Training stage control ──────────────────────────────────────
     def freeze(self) -> None:
         """Freeze all Block 3 parameters."""

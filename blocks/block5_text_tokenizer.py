@@ -9,7 +9,7 @@ Thin wrapper around the Qwen-2.5-0.5B-Instruct BPE tokenizer that:
   - Provides training-stage-aware target builders
   - Builds Qwen-2.5 chat-format prompts for Block 6
 
-Vocab after extension: 151,936 + 8 audio tokens = 151,944
+Vocab after extension: 151,665 + 8 audio tokens = 151,673
 
 No neural network. No GPU required. Pure HuggingFace tokenizers.
 ══════════════════════════════════════════════════════════════════════
@@ -193,10 +193,14 @@ class Block5TextTokenizer:
 
     def audio_open_id(self, audio_idx: int) -> int:
         """Token ID for <audioN>. audio_idx is 1-based."""
+        if not isinstance(audio_idx, int) or not (1 <= audio_idx <= MAX_AUDIOS):
+            raise ValueError(f"audio_idx must be between 1 and {MAX_AUDIOS}")
         return self._token_id(f"<audio{audio_idx}>")
 
     def audio_close_id(self, audio_idx: int) -> int:
         """Token ID for </audioN>. audio_idx is 1-based."""
+        if not isinstance(audio_idx, int) or not (1 <= audio_idx <= MAX_AUDIOS):
+            raise ValueError(f"audio_idx must be between 1 and {MAX_AUDIOS}")
         return self._token_id(f"</audio{audio_idx}>")
 
     # ── Core encode / decode ──────────────────────────────────────────
@@ -328,6 +332,10 @@ class Block5TextTokenizer:
         Returns:
             TrainingTarget with input_ids [prompt + target] and loss_mask
         """
+        # Validate stage parameter early
+        if not isinstance(stage, int) or not (1 <= stage <= 4):
+            raise ValueError("stage must be 1..4")
+
         if stage == 4:
             if not think_text:
                 raise ValueError("stage=4 requires think_text")
