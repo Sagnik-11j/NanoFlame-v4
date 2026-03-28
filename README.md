@@ -26,12 +26,12 @@ Audio → [Chunk] → [Whisper ║ OpenBEATs] → [Fuse] → [Adapt]
 | Speech Encoder | Whisper-Medium (encoder only) | ~300M | ~0.58 GB |
 | Sound/Music Encoder | OpenBEATs-Large | ~300M | ~0.58 GB |
 | Language Model | Qwen-2.5-0.5B-Instruct (4-bit NF4) | 0.5B | ~0.25 GB |
-| Perceiver Resampler | Learned queries | — | ~0.03 GB |
+| Perceiver Resampler | Learned queries | — | ~0.05 GB |
 | Cross-Attn Fusion + MLP Adaptor | Bridge layers | ~10M | ~0.08 GB |
 | QLoRA Adapters (r=16) | fp16 | ~25M | ~0.04 GB |
-| **Total** | | | **~2.09 GB ✅** |
+| **Total** | | | **~2.11 GB ✅** |
 
-> ~3.91 GB of VRAM headroom on a 6 GB card.
+> ~3.89 GB of VRAM headroom on a 6 GB card.
 
 ---
 
@@ -348,7 +348,7 @@ All stages use: gradient checkpointing · bf16 mixed precision · AdamW · batch
 | Qwen-2.5-0.5B-Instruct (4-bit NF4) | ~0.25 GB | unchanged |
 | Whisper-Medium encoder (fp16, ~300M) | ~0.58 GB | ↑ was ~0.24 GB (Small) |
 | OpenBEATs-Large (fp16, ~300M) | ~0.58 GB | ↑ was ~0.18 GB (Base) |
-| Perceiver Resampler (fp16, 64 queries) | ~0.03 GB | slightly larger (1024-dim) |
+| Perceiver Resampler (fp16, 64 queries) | ~0.05 GB | 2 cross-attn layers × ~12.6M params |
 | Cross-Attn Fusion + MLP Adaptor (fp16) | ~0.08 GB | slightly larger (1024-dim) |
 | QLoRA adapters (fp16, r=16) | ~0.04 GB | slightly larger (bigger encoders) |
 | KV cache (24L, 2 KV-heads, ~800 tokens) | ~0.08 GB | unchanged |

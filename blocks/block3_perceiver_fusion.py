@@ -120,6 +120,9 @@ class PerceiverResampler(nn.Module):
     """
     Compresses h_ob [B, 1496, 1024] → h_resampled [B, 64, 1024]
 
+    2-layer cross-attention: queries attend to h_ob twice,
+    refining the compressed representation in each pass.
+
     Q = learned queries   [B, 64,   1024]
     K = h_ob patches      [B, 1496, 1024]
     V = h_ob patches      [B, 1496, 1024]
@@ -131,7 +134,7 @@ class PerceiverResampler(nn.Module):
         d_model:   int = 1024,
         n_queries: int = 64,
         n_heads:   int = 16,
-        n_layers:  int = 1,
+        n_layers:  int = 2,
         dropout:   float = 0.0,
     ) -> None:
         super().__init__()
@@ -294,7 +297,7 @@ class Block3PerceiverFusion(nn.Module):
         n_queries:   int = 64,       # Perceiver output tokens
         n_heads_3a:  int = 16,       # Perceiver cross-attn heads
         n_heads_3b:  int = 16,       # Fusion cross-attn heads
-        n_layers_3a: int = 1,        # Perceiver depth
+        n_layers_3a: int = 2,        # Perceiver depth
         max_chunks:  int = 64,       # Max audio chunks for long-form
         dropout:     float = 0.0,
     ) -> None:

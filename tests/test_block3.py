@@ -11,7 +11,7 @@ Exact class names confirmed from source files:
 
   Block 2a : Block2aWhisperEncoder   (blocks/block2a_whisper_encoder.py)
                forward(mel)          → WhisperEncoderOutput  .h_w
-               downloads openai/whisper-medium on first init
+               downloads openai/whisper-medium ONCE on first init
 
   Block 2b : Block2bOpenBEATsEncoder (blocks/block2b_openbeats_encoder.py)
                forward(mel)          → OpenBEATsEncoderOutput  .h_ob
@@ -112,18 +112,28 @@ def get_block1():
     return AudioFrontend
 
 
-def get_block2a():
-    """
-    Class  : Block2aWhisperEncoder   ← NOT 'WhisperEncoder'
-    Output : WhisperEncoderOutput
-               .h_w        Tensor [B, 750, 1024]
-               .num_tokens 750
-               .num_chunks B
-    NOTE   : Downloads openai/whisper-medium from HuggingFace on first init.
-             Subsequent runs use the local HF cache (~/.cache/huggingface/).
-    """
+def get_block2a_class():
+    """Returns the Block2aWhisperEncoder CLASS only — no instantiation."""
     from blocks.block2a_whisper_encoder import Block2aWhisperEncoder
     return Block2aWhisperEncoder
+
+
+def build_whisper_encoder(Block2aWhisperEncoder, device: str):
+    """
+    Instantiate Block2aWhisperEncoder ONCE, move to device, set eval.
+    This is the only place the HuggingFace download ever happens.
+    All integration tests receive this pre-built instance.
+    """
+    info("Building Block2aWhisperEncoder (downloads whisper-medium on first run)...")
+    try:
+        enc = Block2aWhisperEncoder()
+        enc = enc.to(device)
+        enc.eval()
+        ok_fn("Block2aWhisperEncoder ready")
+        return enc
+    except Exception as e:
+        warn(f"Block2aWhisperEncoder init failed: {e}")
+        return None
 
 
 def load_block2b(ckpt: str, device: str):
@@ -158,7 +168,7 @@ def mel_from_block1(AudioFrontend, seconds: float = 30.0, device: str = "cpu"):
     """
     AudioFrontend.process() only accepts a FILE PATH — not a raw tensor.
     Strategy:
-      1. Synthesise a sine-wave waveform in memory
+      1. Synthesise a multi-tone waveform in memory
       2. Save it to a temp .wav file
       3. Pass the path to af.process()
       4. Return mel.stack()[0:1] → [1, 128, 3000]
@@ -170,25 +180,22 @@ def mel_from_block1(AudioFrontend, seconds: float = 30.0, device: str = "cpu"):
     sr    = 16_000
     n     = int(sr * seconds)
     t_ax  = torch.linspace(0, seconds, n)
-    # Multi-tone signal (more realistic than a single sine)
     audio = (
         0.4 * torch.sin(2 * math.pi * 440.0 * t_ax) +
         0.3 * torch.sin(2 * math.pi * 880.0 * t_ax) +
         0.1 * torch.randn(n).clamp(-1, 1)
-    ).unsqueeze(0)  # [1, N]
-    audio = audio.clamp(-1.0, 1.0)
+    ).unsqueeze(0).clamp(-1.0, 1.0)   # [1, N]
 
     tmp_path = None
     try:
-        # Write temp wav — Block1 reads from disk
         fd, tmp_path = tempfile.mkstemp(suffix=".wav")
         os.close(fd)
         torchaudio.save(tmp_path, audio, sr)
 
         af  = AudioFrontend()
-        out = af.process(tmp_path)           # AudioFrontendOutput
-        mel = out.stack()                    # [N_chunks, 128, 3000]
-        return mel[:1].to(device)            # take first chunk → [1, 128, 3000]
+        out = af.process(tmp_path)      # AudioFrontendOutput
+        mel = out.stack()               # [N_chunks, 128, 3000]
+        return mel[:1].to(device)       # first chunk → [1, 128, 3000]
 
     except Exception as e:
         warn(f"Block1 mel synthesis failed ({e}) — using synthetic mel")
@@ -198,21 +205,28 @@ def mel_from_block1(AudioFrontend, seconds: float = 30.0, device: str = "cpu"):
             os.unlink(tmp_path)
 
 
-def h_w_from_block2a(Block2aWhisperEncoder, mel: torch.Tensor, device: str):
+def h_w_from_enc(whisper_enc, mel: torch.Tensor, device: str):
     """
-    Block2aWhisperEncoder: mel [B, 128, 3000] → WhisperEncoderOutput .h_w [B, 750, 1024]
+    Run inference on a PRE-BUILT Block2aWhisperEncoder instance.
 
-    NOTE: The constructor downloads openai/whisper-medium on first call.
-    Subsequent calls use the HF cache — fast.
-    Falls back to synthetic [B, 750, 1024] if download/forward fails.
+    `whisper_enc` must always be an already-instantiated model (never the class).
+    Passing the class here is a programming error and will raise TypeError
+    immediately — that's intentional so we catch the bug early.
+
+    Returns h_w [B, 750, 1024].
+    Falls back to synthetic tensor only if the forward() itself fails.
     """
+    if isinstance(whisper_enc, type):
+        raise TypeError(
+            "h_w_from_enc() received a CLASS, not an instance. "
+            "Build the encoder once with build_whisper_encoder() and pass the instance."
+        )
+
     B = mel.size(0)
     try:
-        enc = Block2aWhisperEncoder()        # downloads whisper-medium if needed
-        enc = enc.to(device)
         with torch.no_grad():
-            out = enc(mel.to(device))        # → WhisperEncoderOutput
-        h_w = out.h_w                        # Tensor [B, 750, 1024]
+            out = whisper_enc(mel.to(device))
+        h_w = out.h_w                       # WhisperEncoderOutput .h_w
         if h_w.size(-1) != 1024:
             warn(f"Block2a output dim={h_w.size(-1)} ≠ 1024 — projecting")
             proj = nn.Linear(h_w.size(-1), 1024).to(device)
@@ -220,7 +234,7 @@ def h_w_from_block2a(Block2aWhisperEncoder, mel: torch.Tensor, device: str):
                 h_w = proj(h_w)
         return h_w
     except Exception as e:
-        warn(f"Block2aWhisperEncoder failed ({e}) — using synthetic h_w")
+        warn(f"Block2aWhisperEncoder forward failed ({e}) — using synthetic h_w")
         return torch.randn(B, 750, 1024, device=device)
 
 
@@ -371,14 +385,13 @@ def t6_qwen_projection(device, B=2):
 
 def t7_gradient_flow(device, B=2):
     """
-    FIX: Check b3.perceiver.queries.grad and b3.chunk_concat.chunk_pos_enc.grad
-         BEFORE calling b3.zero_grad() — after zero_grad() all .grad are None.
+    Grad checks happen BEFORE zero_grad() — after zero_grad() all .grad are None.
     """
     hdr("T7 · Gradient flow through all sub-modules")
     Block3, *_ = get_block3()
 
     b3 = Block3().to(device)
-    b3.unfreeze()   # Block3PerceiverFusion.unfreeze() — correct method name
+    b3.unfreeze()
 
     out = b3(
         h_ob=torch.randn(B, 1496, 1024, device=device),
@@ -386,7 +399,7 @@ def t7_gradient_flow(device, B=2):
     )
     out.h_full.mean().backward()
 
-    # ── Check specific params BEFORE zero_grad() ─────────────────────────
+    # ── Check specific params BEFORE zero_grad() ─────────────────
     queries_has_grad = (
         b3.perceiver.queries.grad is not None and
         b3.perceiver.queries.grad.abs().max() > 0
@@ -395,26 +408,17 @@ def t7_gradient_flow(device, B=2):
         b3.chunk_concat.chunk_pos_enc.grad is not None and
         b3.chunk_concat.chunk_pos_enc.grad.abs().max() > 0
     )
-
-    # ── Overall coverage ──────────────────────────────────────────────────
     pct = grad_cov(b3)
 
-    # ── NOW zero the grads ────────────────────────────────────────────────
+    # ── NOW zero the grads ────────────────────────────────────────
     b3.zero_grad()
 
-    # ── Report ────────────────────────────────────────────────────────────
     check("≥80% params received gradient", pct >= 0.80, f"({pct*100:.0f}%)")
     check("Perceiver queries received gradient", queries_has_grad)
     check("ChunkConcat pos-enc received gradient", pos_enc_has_grad)
 
 
 def t8_stage_control(device):
-    """
-    Block3PerceiverFusion stage-control API:
-      freeze()                     — freeze all params
-      unfreeze()                   — unfreeze all params
-      enable_training_dropouts(p)  — set all Dropout layers to p
-    """
     hdr("T8 · Stage control: freeze() / unfreeze() / enable_training_dropouts()")
     Block3, *_ = get_block3()
     b3    = Block3().to(device)
@@ -464,6 +468,9 @@ def t9_output_dataclass(device, B=2):
 # ══════════════════════════════════════════════════════════════════════
 # ──────────────────────────────────────────────────────────────────────
 #  INTEGRATION TESTS — Block1 → Block2a → Block2b → Block3
+#
+#  All functions accept `whisper_enc` — a pre-built instance, never the class.
+#  HuggingFace is called exactly once: build_whisper_encoder() in main().
 # ──────────────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════
 
@@ -503,12 +510,12 @@ def ti2_block2b_shapes(b2b, mel, device):
     return h_ob
 
 
-def ti3_block2a_shapes(Block2aWhisperEncoder, mel, device):
+def ti3_block2a_shapes(whisper_enc, mel, device):
+    """whisper_enc is a pre-built instance — no HF download here."""
     hdr("TI3 · Block2a (Block2aWhisperEncoder) — h_w shape")
-    info("First run downloads openai/whisper-medium (~1.5 GB). "
-         "Subsequent runs use HF cache.")
+    info("Using pre-built Whisper instance (HF weights already loaded).")
 
-    h_w = h_w_from_block2a(Block2aWhisperEncoder, mel, device)
+    h_w = h_w_from_enc(whisper_enc, mel, device)
 
     check("h_w is 3D",            h_w.dim() == 3)
     check("h_w last dim = 1024",  h_w.size(-1) == 1024)
@@ -521,7 +528,8 @@ def ti3_block2a_shapes(Block2aWhisperEncoder, mel, device):
     return h_w
 
 
-def ti4_block3_full(b2b, Block2aWhisperEncoder, AudioFrontend, device):
+def ti4_block3_full(b2b, whisper_enc, AudioFrontend, device):
+    """whisper_enc is the pre-built instance."""
     hdr("TI4 · Full pipeline: Block1→2a→2b→Block3 (single 30s chunk)")
     Block3, *_ = get_block3()
     b3 = Block3().to(device)
@@ -533,7 +541,7 @@ def ti4_block3_full(b2b, Block2aWhisperEncoder, AudioFrontend, device):
         h_ob = b2b(mel).h_ob
     info(f"h_ob     : {tuple(h_ob.shape)}")
 
-    h_w = h_w_from_block2a(Block2aWhisperEncoder, mel, device)
+    h_w = h_w_from_enc(whisper_enc, mel, device)
     info(f"h_w      : {tuple(h_w.shape)}")
 
     with torch.no_grad():
@@ -548,24 +556,33 @@ def ti4_block3_full(b2b, Block2aWhisperEncoder, AudioFrontend, device):
     check("no NaN end-to-end", nonan(out.h_full))
 
     std = out.h_resampled.std().item()
-    check("h_resampled std in realistic range (real weights)",
+    check("h_resampled std in realistic range",
           0.003 < std < 30.0, f"std={std:.4f}")
 
     info(f"h_full   : {tuple(out.h_full.shape)}")
 
 
-def ti5_multi_chunk_pipeline(b2b, Block2aWhisperEncoder, AudioFrontend, device, N=3):
+def ti5_multi_chunk_pipeline(b2b, whisper_enc, AudioFrontend, device, N=3):
+    """
+    whisper_enc is the pre-built instance — reused for every chunk.
+    HuggingFace is NOT called again here.
+    """
     hdr(f"TI5 · Full pipeline: {N} chunks = {N*30}s audio")
     Block3, *_ = get_block3()
     b3 = Block3().to(device)
 
     chunk_inputs = []
     for i in range(N):
-        mel  = mel_from_block1(AudioFrontend, seconds=30.0, device=device)
+        mel = mel_from_block1(AudioFrontend, seconds=30.0, device=device)
+
         with torch.no_grad():
             h_ob = b2b(mel).h_ob
-        h_w  = h_w_from_block2a(Block2aWhisperEncoder, mel, device)
+
+        # ✅ Reuses the same whisper_enc instance — no re-download, no re-init
+        h_w = h_w_from_enc(whisper_enc, mel, device)
+
         chunk_inputs.append((h_ob, h_w))
+        info(f"  chunk {i+1}/{N}: h_ob={tuple(h_ob.shape)}  h_w={tuple(h_w.shape)}")
 
     with torch.no_grad():
         out = b3.forward_multi_chunk(chunk_inputs)
@@ -587,17 +604,20 @@ def ti5_multi_chunk_pipeline(b2b, Block2aWhisperEncoder, AudioFrontend, device, 
     info(f"h_full seq_len = {out.seq_len} tokens")
 
 
-def ti6_qwen_ready_real(b2b, Block2aWhisperEncoder, AudioFrontend, device):
+def ti6_qwen_ready_real(b2b, whisper_enc, AudioFrontend, device):
+    """whisper_enc is the pre-built instance."""
     hdr("TI6 · End-to-end output → Qwen-2.5-0.5B projection (1024→896)")
     Block3, *_ = get_block3()
     QWEN_DIM   = 896
     b3         = Block3().to(device)
     qwen_proj  = nn.Linear(1024, QWEN_DIM).to(device)
 
-    mel  = mel_from_block1(AudioFrontend, seconds=30.0, device=device)
+    mel = mel_from_block1(AudioFrontend, seconds=30.0, device=device)
+
     with torch.no_grad():
-        h_ob   = b2b(mel).h_ob
-    h_w    = h_w_from_block2a(Block2aWhisperEncoder, mel, device)
+        h_ob = b2b(mel).h_ob
+
+    h_w = h_w_from_enc(whisper_enc, mel, device)
 
     with torch.no_grad():
         out    = b3(h_ob=h_ob, h_w=h_w)
@@ -614,36 +634,30 @@ def ti6_qwen_ready_real(b2b, Block2aWhisperEncoder, AudioFrontend, device):
     info(f"~{750/30:.1f} audio tokens/sec  →  ready for Qwen embedding lookup")
 
 
-def ti7_stage1_gradient(b2b, Block2aWhisperEncoder, AudioFrontend, device):
+def ti7_stage1_gradient(b2b, whisper_enc, AudioFrontend, device):
     """
-    Stage-1 training scenario:
-      Block2b: freeze_base_weights()  ← Block2bOpenBEATsEncoder method
-      Block3:  unfreeze()             ← Block3PerceiverFusion method
-
-    Check BEFORE zero_grad() to capture actual grads.
+    Stage-1 training scenario — whisper_enc is the pre-built instance.
+    Grad checks happen BEFORE zero_grad().
     """
     hdr("TI7 · Stage-1: Block2b frozen, only Block3 trains")
     Block3, *_ = get_block3()
     b3 = Block3().to(device)
 
-    b2b.freeze_base_weights()   # Block2bOpenBEATsEncoder.freeze_base_weights()
-    b3.unfreeze()               # Block3PerceiverFusion.unfreeze()
+    b2b.freeze_base_weights()
+    b3.unfreeze()
 
-    mel  = mel_from_block1(AudioFrontend, seconds=10.0, device=device)
+    mel = mel_from_block1(AudioFrontend, seconds=10.0, device=device)
 
-    # Detach h_ob — grad must NOT flow back through frozen Block2b
     with torch.no_grad():
         h_ob = b2b(mel).h_ob
-    h_ob = h_ob.detach()
+    h_ob = h_ob.detach()   # grad must NOT flow back through frozen Block2b
 
-    h_w  = h_w_from_block2a(Block2aWhisperEncoder, mel, device)
+    h_w = h_w_from_enc(whisper_enc, mel, device)
 
     out = b3(h_ob=h_ob, h_w=h_w)
     out.h_full.mean().backward()
 
     pct = grad_cov(b3)
-
-    # Check Block2b encoder grad BEFORE zero_grad
     b2b_has_no_grad = all(p.grad is None for p in b2b._enc.parameters())
 
     b3.zero_grad()
@@ -692,7 +706,7 @@ def main():
     t4_single_chunk_forward(D, B)
     t5_multi_chunk_forward(D, B, N=3)
     t6_qwen_projection(D, B)
-    t7_gradient_flow(D, B)       # FIX: grad checks now BEFORE zero_grad()
+    t7_gradient_flow(D, B)
     t8_stage_control(D)
     t9_output_dataclass(D, B)
 
@@ -702,9 +716,8 @@ def main():
         print(f"{BD}  INTEGRATION TESTS  —  Block1 → Block2a → Block2b → Block3{E}")
         print(f"{BD}{'═'*62}{E}")
 
-        # Import Block1 and Block2a SEPARATELY so one failure doesn't hide the other
         AudioFrontend = None
-        Block2aWhisperEncoder = None
+        Block2aClass  = None
 
         try:
             AudioFrontend = get_block1()
@@ -713,30 +726,38 @@ def main():
             skip(f"Block1 import failed: {e}")
 
         try:
-            Block2aWhisperEncoder = get_block2a()  # class only — no download yet
-            ok_fn("Block2a (Block2aWhisperEncoder) imported")
+            Block2aClass = get_block2a_class()
+            ok_fn("Block2a (Block2aWhisperEncoder) class imported")
         except ImportError as e:
             skip(f"Block2a import failed: {e}")
 
         b2b, loaded = load_block2b(args.ckpt, D)
 
         missing = []
-        if AudioFrontend         is None: missing.append("Block1 (AudioFrontend)")
-        if Block2aWhisperEncoder is None: missing.append("Block2a (Block2aWhisperEncoder)")
-        if not loaded:                     missing.append("Block2b weights (checkpoint)")
+        if AudioFrontend is None: missing.append("Block1 (AudioFrontend)")
+        if Block2aClass  is None: missing.append("Block2a (Block2aWhisperEncoder)")
+        if not loaded:             missing.append("Block2b weights (checkpoint)")
 
         if missing:
             for m in missing:
                 skip(f"Unavailable: {m}")
             skip("Skipping integration tests — resolve above issues first")
         else:
-            mel = ti1_block1_shapes(AudioFrontend, D)
-            _   = ti2_block2b_shapes(b2b, mel, D)
-            _   = ti3_block2a_shapes(Block2aWhisperEncoder, mel, D)
-            ti4_block3_full(b2b, Block2aWhisperEncoder, AudioFrontend, D)
-            ti5_multi_chunk_pipeline(b2b, Block2aWhisperEncoder, AudioFrontend, D, N=3)
-            ti6_qwen_ready_real(b2b, Block2aWhisperEncoder, AudioFrontend, D)
-            ti7_stage1_gradient(b2b, Block2aWhisperEncoder, AudioFrontend, D)
+            # ✅ Build Whisper ONCE here — HuggingFace called exactly one time
+            # All integration tests below receive the pre-built instance.
+            print(f"\n{BD}  Initialising shared resources (once)...{E}")
+            whisper_enc = build_whisper_encoder(Block2aClass, D)
+
+            if whisper_enc is None:
+                skip("Whisper init failed — skipping integration tests")
+            else:
+                mel = ti1_block1_shapes(AudioFrontend, D)
+                _   = ti2_block2b_shapes(b2b, mel, D)
+                _   = ti3_block2a_shapes(whisper_enc, mel, D)          # instance
+                ti4_block3_full(b2b, whisper_enc, AudioFrontend, D)    # instance
+                ti5_multi_chunk_pipeline(b2b, whisper_enc, AudioFrontend, D, N=3)  # instance, reused in loop
+                ti6_qwen_ready_real(b2b, whisper_enc, AudioFrontend, D)            # instance
+                ti7_stage1_gradient(b2b, whisper_enc, AudioFrontend, D)            # instance
     else:
         skip("Integration tests skipped (--skip-integration)")
 
@@ -749,7 +770,7 @@ def main():
 
     if FAIL == 0:
         print(f"\n{G}{BD}✔  All tests passed — pipeline ready through Block3.{E}")
-        print(f"\n  Next step: Block 4 (Qwen-2.5-0.5B-Instruct, 4-bit)\n")
+        print(f"\n  Next: Block 4 — MLP Adaptor (audio → LLM embedding space)\n")
     else:
         print(f"\n{R}{BD}✘  {FAIL} test(s) failed — see output above.{E}\n")
         sys.exit(1)
