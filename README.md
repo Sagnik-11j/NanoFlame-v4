@@ -1,6 +1,6 @@
 # NanoFlame v4 — Laptop-Scale Hybrid Audio LM
 
-**Whisper-Small + OpenBEATs-Base + Qwen-2.5-0.5B-Instruct (4-bit)**  
+**Whisper-Medium + OpenBEATs-Large + Qwen-2.5-0.5B-Instruct (4-bit)**  
 **6 GB VRAM · 16 GB RAM · Trained CoT · Multi-Audio Support**
 
 ---
@@ -23,15 +23,16 @@ Audio → [Chunk] → [Whisper ║ OpenBEATs] → [Fuse] → [Adapt]
 
 | Component | Model | Params | VRAM |
 |---|---|---|---|
-| Speech Encoder | Whisper-Small | 244M | ~0.24 GB |
-| Sound/Music Encoder | OpenBEATs-Base | 90M | ~0.18 GB |
+| Speech Encoder | Whisper-Medium (encoder only) | ~300M | ~0.58 GB |
+| Sound/Music Encoder | OpenBEATs-Large | ~300M | ~0.58 GB |
 | Language Model | Qwen-2.5-0.5B-Instruct (4-bit NF4) | 0.5B | ~0.25 GB |
-| Perceiver Resampler | Learned queries | — | ~0.02 GB |
-| Cross-Attn Fusion + MLP Adaptor | Bridge layers | ~8M | ~0.06 GB |
-| QLoRA Adapters (r=16) | fp16 | ~20M | ~0.02 GB |
-| **Total** | | | **~1.15 GB ✅** |
+| Perceiver Resampler | Learned queries | — | ~0.03 GB |
+| Cross-Attn Fusion + MLP Adaptor | Bridge layers | ~10M | ~0.08 GB |
+| QLoRA Adapters (r=16) | fp16 | ~25M | ~0.04 GB |
+| Block 2b Test | tests/test_block2b.py | Load weights + forward + grad check | — |
+| **Total** | | | **~2.09 GB ✅** |
 
-> ~4.85 GB of VRAM headroom on a 6 GB card.
+> ~3.91 GB of VRAM headroom on a 6 GB card.
 
 ---
 
@@ -71,39 +72,67 @@ The same mel chunk is sent to **both** Block 2a and Block 2b simultaneously and 
 
 ---
 
-### Block 2a — Whisper-Small Encoder *(speech specialist)*
+### Block 2a — Whisper-Medium Encoder *(speech specialist)*
 
-244M parameters. Trained on 680,000 hours of audio across 100+ languages. Only the encoder is used; the decoder is discarded.
+~300M encoder parameters. Trained on 680,000 hours of audio across 100+ languages. Only the encoder is used; the decoder is discarded.
 
 | Step | Operation | Output |
 |---|---|---|
-| 2a-1 | Conv1(128→768, k=3, s=1) + Conv2(768→768, k=3, s=2) → time 3000→1500 | `[1500, 768]` |
-| 2a-2 | Sinusoidal positional embeddings (1D, fixed) | `[1500, 768]` |
-| 2a-3 | 6× Transformer encoder blocks (8-head MHSA, bidirectional, FFN 768→3072→768) | `[1500, 768]` |
-| 2a-4 | Output at 50 Hz | `[1500, 768]` |
-| 2a-5 | Stride-2 temporal pooling (AvgPool1d k=2, s=2) | **`h_w [750, 768]`** @ 25 Hz |
+| 2a-1 | 2× strided Conv1D stem: Conv1(128→1024, k=3, s=1) then Conv2(1024→1024, k=3, s=2) | `[1500, 1024]` |
+| 2a-2 | Sinusoidal positional embeddings (1D, fixed) | `[1500, 1024]` |
+| 2a-3 | 24× Transformer encoder blocks (16-head MHSA, bidirectional, FFN 1024→4096→1024) | `[1500, 1024]` |
+| 2a-4 | Output at 50 Hz | `[1500, 1024]` |
+| 2a-5 | Stride-2 temporal pooling (AvgPool1d k=2, s=2) | **`h_w [750, 1024]`** @ 25 Hz |
 
-> **whisper-small hidden dim = 768** (not 512 — that is whisper-base). Input `[128 × 3000]` enters the Conv stem; the second Conv has stride 2, halving the time axis: 3000 → 1500. The original `conv1` expects 80 mel bins; we replace it with `Conv1d(128→768)`, copying pretrained weights for channels 0–79 and Xavier-initialising channels 80–127.
+> **whisper-medium hidden dim = 1024**, with 24 encoder layers and 16 attention heads — vs whisper-small's 768-dim / 6 layers. The original `conv1` expects 80 mel bins; we replace it with `Conv1d(128→1024)`, copying pretrained weights for channels 0–79 and Xavier-initialising channels 80–127.
+
+LoRA r=16, α=32 applied to Q/K/V/O projections from Stage 2 onward.
+
+---
+
+### Block 2b — OpenBEATs-Large Encoder *(sound / music / bioacoustics SSL)*
+
+~300M parameters. Trained via iterative masked token prediction on non-speech audio. Never exposed to speech — fully non-redundant with Whisper.
+
+| Step | Operation | Output |
+|---|---|---|
+| 2b-1 | 16×16 non-overlapping patches (**8 freq × 187 time = 1496 patches**) | 1496 patches |
+| 2b-2 | Patch linear embedding: `flatten(16×16) → Linear(256 → 1024)` | `[1496, 1024]` |
+| 2b-3 | 2D positional embeddings (freq-pos + time-pos, learned) | `[1496, 1024]` |
+| 2b-4 | 24× Transformer blocks (16-head MHSA, full global attention, SwiGLU FFN inner=4096) | `[1496, 1024]` |
+| 2b-5 | Full global context captured | **`h_ob [1496, 1024]`** |
+
+> Upgraded from OpenBEATs-Base (768-dim, 12 layers) to **OpenBEATs-Large (1024-dim, 24 layers)**. Patch grid and count remain unchanged at 8×187 = 1496.
+
+> **Implementation note:** `blocks/block2b_openbeats_encoder.py` wraps the ESPnet
+> `BeatsEncoder` directly. Block 1 already produces mel `[B, 128, T]`, so
+> `BeatsEncoder.preprocess()` (which recomputes mel from waveform) is bypassed.
+> The wrapper routes mel directly into `patch_embedding → layer_norm →
+> post_extract_proj → encoder`. No ESPnet2 install is required — lightweight
+> stubs are injected at import time.
 
 LoRA r=16, α=32 applied from Stage 2 onward.
 
 ---
 
-### Block 2b — OpenBEATs-Base Encoder *(sound / music / bioacoustics SSL)*
+### Block 2b — Setup & Verification
 
-90M parameters. Trained via iterative masked token prediction on 20,000 hours of non-speech audio. Never exposed to speech — fully non-redundant with Whisper.
+**Files:**
+- `blocks/beats_encoder.py` — ESPnet source file (do not modify)
+- `blocks/block2b_openbeats_encoder.py` — wrapper, stub injector, weight loader
+- `tests/test_block2b.py` — load + verify test
 
-| Step | Operation | Output |
-|---|---|---|
-| 2b-1 | 16×16 non-overlapping patches (**8 freq × 187 time = 1496 patches**) | 1496 patches |
-| 2b-2 | Patch linear embedding: `flatten(16×16) → Linear(256 → 768)` | `[1496, 768]` |
-| 2b-3 | 2D positional embeddings (freq-pos + time-pos, learned) | `[1496, 768]` |
-| 2b-4 | 12× Transformer blocks (12-head MHSA, full global attention, SwiGLU FFN inner=3072) | `[1496, 768]` |
-| 2b-5 | Full global context captured | **`h_ob [1496, 768]`** |
+**Checkpoint:** Place `epoch_latest.pt` (~1.2 GB) from `shikhar7ssu/OpenBEATs-ICME` in `checkpoints/`.
 
-> Patch count increased from 752 → **1496** because the input is now `[128 × 3000]` (3000 time frames ÷ 16 = 187 patches) vs the old `[128 × 1500]` (1500 ÷ 16 ≈ 94 patches). The Perceiver Resampler in Block 3 absorbs this change — it always compresses to 64 queries regardless of input length.
+**Run test:**
+```bash
+python tests/test_block2b.py
+```
 
-LoRA r=16, α=32 applied from Stage 2 onward.
+**Known issues fixed:**
+- Checkpoint was saved on CUDA → always load with `map_location="cpu"`
+- `BeatsConfig` object not iterable → pass `_OPENBEATS_CFG_OVERRIDES` dict directly to `BeatsEncoder`
+- ESPnet import path is `espnet2.legacy.nets.pytorch_backend.nets_utils` (not `espnet2.asr.nets`)
 
 ---
 
@@ -112,19 +141,20 @@ LoRA r=16, α=32 applied from Stage 2 onward.
 Merges the two encoder outputs into a single unified representation.
 
 ```
-h_w  [750  × 768]  (Whisper-Small)
-h_ob [1496 × 768]  (OpenBEATs-Base)
+h_w  [750  × 1024]  (Whisper-Medium)
+h_ob [1496 × 1024]  (OpenBEATs-Large)
 ```
 
-Both encoders output **768-dim** — no dimension projection is needed.
+
+Both encoders output **1024-dim** — no dimension projection is needed.
 
 | Step | Operation | Output |
 |---|---|---|
-| 3a | Perceiver Resampler: 64 learnable queries × 2-layer cross-attention compress h_ob | `h_resampled [64, 768]` |
-| 3b | Cross-attention fusion: Q=h_w, K=h_resampled, V=h_resampled (8 heads) + residual | `h_fused [750, 768]` |
-| 3c | Long-audio chunk concat (if N > 1) + learnable chunk-index positional encodings | **`h_full [T × 768]`** |
+| 3a | Perceiver Resampler: 64 learnable queries × 2-layer cross-attention compress h_ob | `h_resampled [64, 1024]` |
+| 3b | Cross-attention fusion: Q=h_w, K=h_resampled, V=h_resampled (16 heads) + residual | `h_fused [750, 1024]` |
+| 3c | Long-audio chunk concat (if N > 1) + learnable chunk-index positional encodings | **`h_full [T × 1024]`** |
 
-> The old **`Linear(768→512)` projection step has been removed** — since whisper-small's hidden dim is 768, matching OpenBEATs exactly, the Perceiver output feeds cross-attention directly. Each Whisper token now carries both fine phonetic detail (Whisper) and sound/music awareness (OpenBEATs) in the same 768-dim vector.
+> Both Whisper-Medium and OpenBEATs-Large share the same 1024-dim output space — no projection step needed. Each Whisper token at time t carries both phonetic detail and sound/music awareness in the same 1024-dim vector.
 
 ---
 
@@ -132,19 +162,21 @@ Both encoders output **768-dim** — no dimension projection is needed.
 
 The only bridge between the audio world and the language model's embedding space. **Only this block trains in Stage 1.**
 
+
 ```
-in:  h_full [T × 768]
-  ├─ Linear(768 → 896)       project into LLM hidden dim (ratio 1.17×)
-  ├─ GELU                    smooth nonlinearity
-  ├─ Dropout(p=0.1)          regularisation
-  ├─ Linear(896 → 896)       refine within LLM dim space
-  ├─ RMSNorm                 normalise for LLM compatibility
-  └─ + Residual shortcut     Linear(768 → 896) on original input
+in: h_full [T × 1024]
+├─ Linear(1024 → 896) compress into LLM hidden dim (ratio 0.875×)
+├─ GELU smooth nonlinearity
+├─ Dropout(p=0.1) regularisation
+├─ Linear(896 → 896) refine within LLM dim space
+├─ RMSNorm normalise for LLM compatibility
+└─ + Residual shortcut Linear(1024 → 896) on original input
 
 out: audio_tokens [T × 896]
 ```
 
-> Input dim changed from 512 → **768** to match the confirmed whisper-small + OpenBEATs hidden dim. Expansion ratio is now 768→896 (1.17×) rather than the earlier 512→896 (1.75×).
+
+> Input dim updated from 768 → **1024** to match upgraded encoders. The adaptor now **compresses** (1024→896, ratio 0.875×) rather than expanding — this is fine since the richer 1024-dim encoder representations have more redundancy to compress from.
 
 ---
 
@@ -164,6 +196,7 @@ Qwen-2.5 BPE tokenizer, vocabulary = 151,936.
 
 Everything assembled into a single flat sequence in Qwen-2.5 chat format:
 
+
 ```
 [BOS]
 <|im_start|>system
@@ -177,6 +210,7 @@ What emotion does the speaker convey? Compare with audio 2.
 <|im_start|>assistant
 ← model generates from here
 ```
+
 
 Audio tokens (already 896-dim) bypass the embedding table and are injected directly. Text tokens are looked up in the embedding table → 896-dim vectors. Both live in the same 896-dim space. Loss is computed **only on the assistant response span**.
 
@@ -203,6 +237,7 @@ Audio tokens (already 896-dim) bypass the embedding table and are injected direc
 
 **Internals per decoder block:**
 
+
 ```
 RMSNorm
   └─ Grouped-Query Attention (GQA)
@@ -219,11 +254,12 @@ RMSNorm
 + Residual
 ```
 
+
 RoPE (Rotary Positional Encoding) applied per-layer. 4-bit NF4 base weights are **never updated** — only QLoRA adapters (fp16, r=16) are trained.
 
 ---
 
-### Block 8 — Autoregressive Decoding *(changed: no native CoT, new sampling params)*
+### Block 8 — Autoregressive Decoding
 
 ```
 1. LM head produces logits at last position
@@ -234,6 +270,7 @@ RoPE (Rotary Positional Encoding) applied per-layer. 4-bit NF4 base weights are 
 6. repeat until <|im_end|> or max_new_tokens
 7. decode token IDs → final answer string
 ```
+
 
 **KV cache size** (24 layers, 2 KV-heads, 800 tokens): `2 × 24 × 800 × 2 × 64 × 2 bytes ≈ 75 MB`
 
@@ -257,7 +294,7 @@ RoPE (Rotary Positional Encoding) applied per-layer. 4-bit NF4 base weights are 
 | **Frozen** | Whisper, OpenBEATs, LLM (4-bit NF4) | LLM (4-bit NF4) | LLM base (4-bit) | LLM base (4-bit) |
 | **Data** | AudioCaps, ClothoV2, MusicCaps, ESC-50 QA | AudioCaps, MusicCaps, LibriSpeech, VoxCeleb, FSD-50K QA | AudioSkills, WavText5K, Custom MCQs | Synthetic CoT traces (~50k), multi-audio dialogue, AF-Chat pairs |
 | **Loss** | CE on answer tokens only | CE on answer tokens only | CE on answer tokens only (no `<think>`) | CE on `<think>` span + answer span |
-| **Time** | ~2h | ~6h | ~10h | ~6h |
+| **Time** | ~3h | ~10h | ~12h | ~8h |
 | **Goal** | Bridge audio → 896-dim LLM space | 3-domain unified encoder repr. | Audio-grounded QA reasoning | On-demand CoT + multi-audio chat |
 
 All stages use: gradient checkpointing · bf16 mixed precision · AdamW · batch=16, grad_accum=4 (effective batch=64) · cosine LR decay.
@@ -276,51 +313,44 @@ All stages use: gradient checkpointing · bf16 mixed precision · AdamW · batch
 
 | Component | VRAM | Notes |
 |---|---|---|
-| Qwen-2.5-0.5B-Instruct (4-bit NF4) | ~0.25 GB | ↓ was 0.75 GB in v3 |
-| Whisper-Small (fp16, 244M) | ~0.24 GB | unchanged |
-| OpenBEATs-Base (fp16, 90M) | ~0.18 GB | unchanged |
-| Perceiver Resampler (fp16, 64 queries) | ~0.02 GB | unchanged |
-| Cross-Attn Fusion + MLP Adaptor (fp16) | ~0.06 GB | smaller now |
-| QLoRA adapters (fp16, r=16, 0.5B) | ~0.02 GB | ↓ was 0.05 GB |
-| KV cache (24L, 2 KV-heads, ~800 tokens) | ~0.08 GB | ↓ was 0.15 GB |
-| Activations + gradient buffers | ~0.30 GB | ↓ was 0.50 GB |
-| **Total** | **~1.15 GB ✅** | **~4.85 GB free** |
-
-### What You Can Do With the Headroom
-
-- Upgrade to **OpenBEATs-Large (300M)** → +0.42 GB, total ~1.57 GB
-- Run **two full pipelines in parallel** → 2× training throughput
-- Use **batch size 32+** during training → faster convergence
-- Extend **max audio to 10 minutes** (20 chunks) → still only ~1.5 GB total
-- Keep everything in **fp16**, skip int8 → simpler code
-- Add a **second Whisper-Medium** → richer speech features
+| Qwen-2.5-0.5B-Instruct (4-bit NF4) | ~0.25 GB | unchanged |
+| Whisper-Medium encoder (fp16, ~300M) | ~0.58 GB | ↑ was ~0.24 GB (Small) |
+| OpenBEATs-Large (fp16, ~300M) | ~0.58 GB | ↑ was ~0.18 GB (Base) |
+| Perceiver Resampler (fp16, 64 queries) | ~0.03 GB | slightly larger (1024-dim) |
+| Cross-Attn Fusion + MLP Adaptor (fp16) | ~0.08 GB | slightly larger (1024-dim) |
+| QLoRA adapters (fp16, r=16) | ~0.04 GB | slightly larger (bigger encoders) |
+| KV cache (24L, 2 KV-heads, ~800 tokens) | ~0.08 GB | unchanged |
+| Activations + gradient buffers | ~0.45 GB | ↑ larger encoders |
+| **Total** | **~2.09 GB ✅** | **~3.91 GB free** |
 
 ---
 
 ## Training Speed
 
-With only 0.5B parameters, every forward/backward pass is ~3× faster than the 1.5B model:
+Larger encoders mean slower forward/backward passes than the Small+Base configuration:
 
 | Stage | Time |
 |---|---|
-| Stage 1 | ~2 hours |
-| Stage 2 | ~6 hours |
-| Stage 3 | ~10 hours |
-| Stage 4 | ~6 hours |
-| **Total** | **< 24 hours** |
+| Stage 1 | ~3 hours |
+| Stage 2 | ~10 hours |
+| Stage 3 | ~12 hours |
+| Stage 4 | ~8 hours |
+| **Total** | **~33 hours** |
 
-The massive VRAM headroom also allows batch sizes of 16–32, further accelerating convergence — faster than any prior NanoFlame version.
+Still within a single overnight+day run. The ~3.91 GB VRAM headroom allows batch sizes of 16–32 to keep training efficient.
 
 ---
 
 ## Block Connection Diagram
 
+
 ```
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║             NanoFlame v4 — Laptop-Scale Hybrid Audio LM                      ║
-║       Whisper-Small + OpenBEATs-Base + Qwen-2.5-0.5B-Instruct (4-bit)        ║
+║       Whisper-Medium + OpenBEATs-Large + Qwen-2.5-0.5B-Instruct (4-bit)      ║
 ║            6 GB VRAM · 16 GB RAM · Trained CoT · Multi-Audio Support         ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
+
 
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  INPUTS                                                                  │
@@ -371,101 +401,101 @@ The massive VRAM headroom also allows batch sizes of 16–32, further accelerati
               ▼                             ▼
 ┌─────────────────────────┐   ┌───────────────────────────────────────┐
 │  BLOCK 2a               │   │  BLOCK 2b                             │
-│  WHISPER-SMALL ENCODER  │   │  OPENBEATS-BASE ENCODER               │
+│  WHISPER-MEDIUM ENCODER │   │  OPENBEATS-LARGE ENCODER              │
 │  Speech Specialist      │   │  Sound · Music · Bioacoustics SSL     │
-│  244M params            │   │  90M params                           │
-│  hidden dim = 768       │   │  hidden dim = 768                     │
+│  ~300M params           │   │  ~300M params                         │
+│  hidden dim = 1024      │   │  hidden dim = 1024                    │
 ├─────────────────────────┤   ├───────────────────────────────────────┤
 │                         │   │                                       │
 │  in: [128 × 3000]       │   │  in: [128 × 3000]                     │
 │       │                 │   │       │                               │
 │       ▼                 │   │       ▼                               │
 │  [2a-1] Conv1D Stem     │   │  [2b-1] Patchify                      │
-│  Conv1: kernel=3 str=1  │   │  16×16 non-overlapping patches        │
-│  Conv2: kernel=3 str=2  │   │  freq: 128 ÷ 16 = 8 patches           │
+│  Conv1: 128→1024 str=1  │   │  16×16 non-overlapping patches        │
+│  Conv2: 1024→1024 str=2 │   │  freq: 128 ÷ 16 = 8 patches           │
 │  3000 → 1500 time steps │   │  time: 3000 ÷ 16 = 187 patches        │
-│  out: [1500 × 768]      │   │  total: 1496 patches per chunk        │
+│  out: [1500 × 1024]     │   │  total: 1496 patches per chunk        │
 │       │                 │   │       │                               │
 │       ▼                 │   │       ▼                               │
 │  [2a-2] Sinusoidal      │   │  [2b-2] Patch Linear Embedding        │
 │  Positional Embeddings  │   │  flatten 16×16 → 256 values           │
-│  1D time-axis only      │   │  Linear(256 → 768)                    │
-│  added to each token    │   │  out: [1496 × 768]                    │
+│  1D time-axis only      │   │  Linear(256 → 1024)                   │
+│  added to each token    │   │  out: [1496 × 1024]                   │
 │       │                 │   │       │                               │
 │       ▼                 │   │       ▼                               │
-│  [2a-3] 6× Transformer  │   │  [2b-3] 2D Positional Embeddings      │
+│  [2a-3] 24× Transformer │   │  [2b-3] 2D Positional Embeddings      │
 │  Encoder Blocks         │   │  freq-pos emb + time-pos emb          │
 │  ┌─────────────────┐    │   │  summed per patch token               │
-│  │ LayerNorm (pre) │    │   │  out: [1496 × 768]                    │
-│  │ MHSA  8 heads   │    │   │       │                               │
+│  │ LayerNorm (pre) │    │   │  out: [1496 × 1024]                   │
+│  │ MHSA 16 heads   │    │   │       │                               │
 │  │ bidirectional   │    │   │       ▼                               │
-│  │ + Residual      │    │   │  [2b-4] 12× Transformer Blocks        │
+│  │ + Residual      │    │   │  [2b-4] 24× Transformer Blocks        │
 │  │ LayerNorm (pre) │    │   │  ┌─────────────────────────────────┐  │
-│  │ FFN: Lin→GELU   │    │   │  │ LayerNorm (pre-norm)            │  │
-│  │      →Lin       │    │   │  │ MHSA 12 heads                   │  │
+│  │ FFN 1024→4096   │    │   │  │ LayerNorm (pre-norm)            │  │
+│  │      →1024      │    │   │  │ MHSA 16 heads                   │  │
 │  │ + Residual      │    │   │  │ FULL GLOBAL ATTENTION           │  │
 │  └─────────────────┘    │   │  │ all 1496 patches attend all     │  │
 │       │                 │   │  │ + Residual                      │  │
 │       ▼                 │   │  │ LayerNorm (pre-norm)            │  │
-│  [2a-4]                 │   │  │ SwiGLU FFN (3072 inner dim)     │  │
-│  out: [1500 × 768]      │   │  │ + Residual                      │  │
+│  [2a-4]                 │   │  │ SwiGLU FFN (4096 inner dim)     │  │
+│  out: [1500 × 1024]     │   │  │ + Residual                      │  │
 │  @ 50 Hz                │   │  └─────────────────────────────────┘  │
 │       │                 │   │       │                               │
 │       ▼                 │   │       ▼                               │
 │  [2a-5] Stride-2 Pool   │   │  [2b-5]                               │
-│  [1500×768]→[750×768]   │   │  out: [1496 × 768] per chunk          │
+│  [1500×1024]→[750×1024] │   │  out: [1496 × 1024] per chunk         │
 │  @ 25 Hz                │   │  full global context captured         │
 │                         │   │                                       │
 │  LoRA r=16, α=32        │   │  LoRA r=16, α=32                      │
 │  from Stage 2 onward    │   │  from Stage 2 onward                  │
 └───────────┬─────────────┘   └────────────────────┬──────────────────┘
-            │                                       │
-     h_w: [750 × 768]                     h_ob: [1496 × 768]
-            │                                       │
-            └──────────────────┬────────────────────┘
+            │                                      │
+     h_w: [750 × 1024]                     h_ob: [1496 × 1024]
+            │                                      │
+            └──────────────────┬───────────────────┘
                                ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  BLOCK 3 · PERCEIVER RESAMPLER + CROSS-ATTENTION FUSION                  │
-│  (no dim projection — both encoders output 768-dim)                      │
+│  (no dim projection — both encoders output 1024-dim)                     │
 ├──────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
 │  [3a] Perceiver Resampler  (OpenBEATs: 1496 tokens → 64 tokens)          │
 │  ┌─────────────────────────────────────────────────────────────────┐     │
-│  │    Q = learned queries        [64   × 768]                      │     │
-│  │    K = OpenBEATs patches      [1496 × 768]  ← h_ob              │     │
-│  │    V = OpenBEATs patches      [1496 × 768]                      │     │
-│  │    out: h_resampled [64 × 768]                                  │     │
+│  │    Q = learned queries        [64   × 1024]                     │     │
+│  │    K = OpenBEATs patches      [1496 × 1024]  ← h_ob             │     │
+│  │    V = OpenBEATs patches      [1496 × 1024]                     │     │
+│  │    out: h_resampled [64 × 1024]                                 │     │
 │  └──────────────────────────────────┬──────────────────────────────┘     │
-│                                     │  h_resampled: [64 × 768]           │
+│                                     │  h_resampled: [64 × 1024]          │
 │                                     ▼                                    │
-│  h_w   [750 × 768]  ──────────────────┘                                  │
+│  h_w   [750 × 1024]  ───────────────┘                                    │
 │                                     ▼                                    │
 │  [3b] Cross-Attention Fusion                                             │
 │  ┌─────────────────────────────────────────────────────────────────┐     │
-│  │  Q = h_w         [750 × 768]  ← Whisper tokens                  │     │
-│  │  K = h_resampled [ 64 × 768]  ← OpenBEATs summary               │     │
-│  │  V = h_resampled [ 64 × 768]                                    │     │
-│  │  8 attention heads · 1 cross-attn layer                         │     │
-│  │  out + residual: h_fused [750 × 768]                            │     │
+│  │  Q = h_w         [750 × 1024]  ← Whisper tokens                 │     │
+│  │  K = h_resampled [ 64 × 1024]  ← OpenBEATs summary              │     │
+│  │  V = h_resampled [ 64 × 1024]                                   │     │
+│  │  16 attention heads · 1 cross-attn layer                        │     │
+│  │  out + residual: h_fused [750 × 1024]                           │     │
 │  └──────────────────────────────────┬──────────────────────────────┘     │
 │                                     │                                    │
 │  [3c] Long-Audio Chunk Concat  (when N > 1)                              │
 │  ┌─────────────────────────────────────────────────────────────────┐     │
-│  │  h_full = cat([h_fused_1, ..., h_fused_N])  →  [750N × 768]     │     │
+│  │  h_full = cat([h_fused_1, ..., h_fused_N])  →  [750N × 1024]    │     │
 │  │  + learnable chunk-index positional encodings per chunk         │     │
-│  │  out: h_full [T × 768]                                          │     │
+│  │  out: h_full [T × 1024]                                         │     │
 │  └──────────────────────────────────┬──────────────────────────────┘     │
 └─────────────────────────────────────┼────────────────────────────────────┘
-                                      │  h_full: [T × 768]
+                                      │  h_full: [T × 1024]
                                       ▼
 ┌──────────────────────────────────────────────────────────────────────────┐
 │  BLOCK 4 · MLP ADAPTOR                                                   │
-│  input dim: 768 (confirmed)   output dim: 896 (LLM hidden)               │
+│  input dim: 1024 (confirmed)  output dim: 896 (LLM hidden)               │
 ├──────────────────────────────────────────────────────────────────────────┤
 │                                                                          │
-│  in: h_full [T × 768]                                                    │
+│  in: h_full [T × 1024]                                                   │
 │       │                                                                  │
-│       ├─ Linear(768 → 896)     project to LLM hidden dim  (ratio 1.17×)  │
+│       ├─ Linear(1024 → 896)   compress to LLM hidden dim (ratio 0.875×)  │
 │       │                                                                  │
 │       ├─ GELU activation       smooth nonlinearity                       │
 │       │                                                                  │
@@ -475,7 +505,7 @@ The massive VRAM headroom also allows batch sizes of 16–32, further accelerati
 │       │                                                                  │
 │       ├─ RMSNorm               normalise values                          │
 │       │                                                                  │
-│       └─ + Residual shortcut   Linear(768 → 896) on original input       │
+│       └─ + Residual shortcut   Linear(1024 → 896) on original input      │
 │                                                                          │
 │  out: audio_tokens [T × 896]                                             │
 │                                                                          │
@@ -582,8 +612,8 @@ The massive VRAM headroom also allows batch sizes of 16–32, further accelerati
 | Block | Status | Tests |
 |---|---|---|
 | Block 1 — Audio Frontend | ✅ Complete | 16/16 passing |
-| Block 2a — Whisper-Small Encoder | ✅ Complete | 26/26 |
-| Block 2b — OpenBEATs-Base Encoder | 🔲 Next | — |
+| Block 2a — Whisper-Medium Encoder | ✅ Complete | 26/26 |
+| Block 2b — OpenBEATs-Large Encoder | ✅ Complete | passed |
 | Block 3 — Perceiver Resampler + Fusion | 🔲 Pending | — |
 | Block 4 — MLP Adaptor | 🔲 Pending | — |
 | Block 5 — Text Tokenizer | 🔲 Pending | — |
