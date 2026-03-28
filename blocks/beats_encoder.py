@@ -314,7 +314,7 @@ class BeatsEncoder(AbsEncoder):
         features: torch.Tensor,
         padding_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Forward padding mask. Featuires: BTC, padding_mask: BT."""
+        """Forward padding mask. Features: BTC, padding_mask: BT."""
         extra = padding_mask.size(1) % features.size(1)
         if extra > 0:
             padding_mask = padding_mask[:, :-extra]
@@ -453,17 +453,17 @@ class BeatsEncoder(AbsEncoder):
             features = self.downsample_conv(features.transpose(1, 2)).transpose(
                 1, 2
             )  # BTC
-            padding_mask = self.forward_padding_mask(features, padding_mask)
+            if padding_mask is not None:
+                padding_mask = self.forward_padding_mask(features, padding_mask)
 
         if self.conformer_adapter:
             # to handle incompatibility btw torch & huggingface
-            conformer_attn_mask = ~padding_mask
+            conformer_attn_mask = ~padding_mask if padding_mask is not None else None
             # run through conformer
             features = self.conformer_adapter(
                 features,
                 attention_mask=conformer_attn_mask,
             ).last_hidden_state
-
         if self.cross_embed_positions is not None:
             features = features + self.cross_embed_positions(features)
 
@@ -954,7 +954,7 @@ class MultiheadAttention(nn.Module):
             if not torch.jit.is_scripting():
                 assert key_bsz == bsz
                 assert value is not None
-                assert src_len, bsz == value.shape[:2]
+                assert (src_len, bsz) == value.shape[:2]
 
         if self.has_relative_attention_bias and position_bias is None:
             position_bias = self.compute_bias(tgt_len, src_len)
