@@ -29,9 +29,9 @@ Audio → [Chunk] → [Whisper ║ OpenBEATs] → [Fuse] → [Adapt]
 | Perceiver Resampler | Learned queries | — | ~0.05 GB |
 | Cross-Attn Fusion + MLP Adaptor | Bridge layers | ~10M | ~0.08 GB |
 | QLoRA Adapters (r=16) | fp16 | ~25M | ~0.04 GB |
-| **Total** | | | **~2.11 GB ✅** |
+| **Total** | | | **~1.58 GB ✅** |
 
-> ~3.89 GB of VRAM headroom on a 6 GB card.
+> ~4.42 GB of VRAM headroom on a 6 GB card.
 
 ---
 
@@ -216,13 +216,40 @@ out: audio_tokens [T × 896]
 
 ### Block 5 — Text Tokenizer *(runs in parallel with Blocks 1–4)*
 
-Qwen-2.5 BPE tokenizer, vocabulary = 151,936.
+Qwen-2.5 BPE tokenizer, vocabulary = 151,944.
 
 - Text question → integer token IDs → fed into Block 6
 - Same tokenizer across all Qwen-2.5 variants (0.5B / 1.5B / 7B)
 - Custom audio boundary tokens added: `<audio1>`, `</audio1>`, `<audio2>`, `</audio2>`, etc.
 - Training Stages 1–3: ground-truth answer tokens only
 - Training Stage 4: `<think>...</think>` + answer tokens
+
+---
+
+###  Setup & Verification
+
+**Files:**
+- `blocks/block5_text_tokenizer.py` — `Block5TextTokenizer`, `TokenizerOutput`, `ChatPrompt`, `TrainingTarget`
+- `tests/test_block5.py` — 10 unit tests (no GPU required)
+- `tests/conftest.py` — add `test_block5.py` to `collect_ignore`
+
+**No checkpoint required** — downloads Qwen-2.5-0.5B tokenizer from HuggingFace on first run (~1 MB, not the model weights).
+
+**Run tests:**
+```bash
+python tests/test_block5.py
+
+# Skip HF network call after first run:
+python tests/test_block5.py --local-dir ./qwen_local
+```
+
+**Tests cover:** tokenizer load + vocab size · audio boundary token IDs (8 tokens added) · encode/decode round-trip · chat prompt structure (system/user/assistant turns) · multi-audio placeholders · CoT trigger insertion · Stage 1–3 training targets (loss on answer span only) · Stage 4 training target (loss on `<think>` span + answer) · token count helpers · max-length truncation · deterministic tokenization.
+
+**Vocab:** base 151,936 + 8 audio tokens (`<audio1>`…`<audio4>`, `</audio1>`…`</audio4>`) = **151,944 total**.
+
+---
+
+> **Implementation:** `build_chat_prompt()` places `<audioN> </audioN>` boundary tokens as placeholders in the user turn. Block 6 replaces the span between these boundary tokens with real `audio_tokens [T × 896]` from Block 4. `build_training_target(stage=N)` produces the full token sequence + binary `loss_mask` in one call — loss is applied only on the assistant span.
 
 ---
 
@@ -355,7 +382,7 @@ All stages use: gradient checkpointing · bf16 mixed precision · AdamW · batch
 | QLoRA adapters (fp16, r=16) | ~0.04 GB | slightly larger (bigger encoders) |
 | KV cache (24L, 2 KV-heads, ~800 tokens) | ~0.08 GB | unchanged |
 | Activations + gradient buffers | ~0.45 GB | ↑ larger encoders |
-| **Total** | **~2.09 GB ✅** | **~3.91 GB free** |
+| **Total** | **~1.58 GB ✅** | **~4.42 GB free** |
 
 ---
 
@@ -647,11 +674,11 @@ Still within a single overnight+day run. The ~3.91 GB VRAM headroom allows batch
 | Block | Status | Tests |
 |---|---|---|
 | Block 1 — Audio Frontend | ✅ Complete | 16/16 passing |
-| Block 2a — Whisper-Medium Encoder | ✅ Complete | 26/26 |
-| Block 2b — OpenBEATs-Large Encoder | ✅ Complete | passed |
-| Block 3 — Perceiver Resampler + Fusion | ✅ Complete | 16/16 (9 unit · 7 integration) |
-| Block 4 — MLP Adaptor | ✅ Complete | 43/43 passed |
-| Block 5 — Text Tokenizer | 🔲 Pending | — |
+| Block 2a — Whisper-Medium Encoder | ✅ Complete | 26/26 passing |
+| Block 2b — OpenBEATs-Large Encoder | ✅ Complete | passing |
+| Block 3 — Perceiver Resampler + Fusion | ✅ Complete | 16/16 passing |
+| Block 4 — MLP Adaptor | ✅ Complete | 43/43 passing |
+| Block 5 — Text Tokenizer | ✅ Complete | 65/65 passing |
 | Block 6 — Sequence Packing | 🔲 Pending | — |
 | Block 7 — Qwen-2.5-0.5B LLM | 🔲 Pending | — |
 | Block 8 — Autoregressive Decoding | 🔲 Pending | — |
