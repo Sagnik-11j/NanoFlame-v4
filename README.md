@@ -212,6 +212,8 @@ out: audio_tokens [T × 896]
 
 ---
 
+
+
 ### Block 5 — Text Tokenizer *(runs in parallel with Blocks 1–4)*
 
 Qwen-2.5 BPE tokenizer, vocabulary = 151,936.
@@ -541,7 +543,8 @@ Still within a single overnight+day run. The ~3.91 GB VRAM headroom allows batch
 │                                                                          │
 │  out: audio_tokens [T × 896]                                             │
 │                                                                          │
-│  ← ONLY this block trains in Stage 1. All else frozen. ←                 │
+│  ← This block + Block 3 bridge components train in Stage 1.              |
+|     Encoders and LM frozen. ←                                            │
 └──────────────────────────────────┬───────────────────────────────────────┘
                                    │
                         audio_tokens [T × 896]
@@ -647,7 +650,7 @@ Still within a single overnight+day run. The ~3.91 GB VRAM headroom allows batch
 | Block 2a — Whisper-Medium Encoder | ✅ Complete | 26/26 |
 | Block 2b — OpenBEATs-Large Encoder | ✅ Complete | passed |
 | Block 3 — Perceiver Resampler + Fusion | ✅ Complete | 16/16 (9 unit · 7 integration) |
-| Block 4 — MLP Adaptor | 🔲 Pending | — |
+| Block 4 — MLP Adaptor | ✅ Complete | 43/43 passed |
 | Block 5 — Text Tokenizer | 🔲 Pending | — |
 | Block 6 — Sequence Packing | 🔲 Pending | — |
 | Block 7 — Qwen-2.5-0.5B LLM | 🔲 Pending | — |
