@@ -156,9 +156,9 @@ Both encoders output **1024-dim** — no dimension projection is needed.
 
 > Both Whisper-Medium and OpenBEATs-Large share the same 1024-dim output space — no projection step needed. Each Whisper token at time t carries both phonetic detail and sound/music awareness in the same 1024-dim vector.
 
-**Output dataclass:** `Block3Output` with fields `h_full`, `h_resampled`, `h_fused_chunks`, `n_chunks`, `seq_len`.  
-**Stage control methods:** `freeze_base_weights()` · `unfreeze_all()` · `enable_training_dropouts(p)`.  
-**Multi-chunk API:** `b3.forward_multi_chunk(List[Tuple[h_ob, h_w]])` → concatenates N×750 tokens with learnable chunk-index positional encodings.
+Output dataclass: `Block3Output` with fields `h_full`, `h_resampled`, `h_fused_chunks`, `n_chunks`, `seq_len`.  
+Stage control methods: `freeze_base_weights()` · `unfreeze_all()` · `enable_training_dropouts(p)`.  
+Multi-chunk API: `b3.forward_multi_chunk(List[Tuple[h_ob, h_w]])` → concatenates N×750 tokens with learnable chunk-index positional encodings.
 
 ---
 
@@ -216,7 +216,7 @@ out: audio_tokens [T × 896]
 
 ### Block 5 — Text Tokenizer *(runs in parallel with Blocks 1–4)*
 
-Qwen-2.5 BPE tokenizer, vocabulary = 151,944.
+Qwen-2.5 BPE tokenizer, vocabulary = 151,936.
 
 - Text question → integer token IDs → fed into Block 6
 - Same tokenizer across all Qwen-2.5 variants (0.5B / 1.5B / 7B)
@@ -278,6 +278,28 @@ Audio tokens (already 896-dim) bypass the embedding table and are injected direc
 > **Key difference from v3:** Qwen-2.5-0.5B has no native CoT. `<think>` blocks are NOT automatic. In Stages 1–3 the model trains without CoT targets. In Stage 4, synthetic CoT traces are explicitly injected as training targets, triggered by the prompt suffix: *"Think step by step before answering."*
 
 ---
+
+### Block 6 — Setup & Verification
+
+**Files:**
+- `blocks/block6_sequence_packer.py` — `Block6SequencePacker`, `PackedSequence`
+- `tests/test_block6.py` — 10 unit tests + 3 integration tests
+- `tests/conftest.py` — add `test_block6.py` to `collect_ignore`
+
+**No checkpoint required** for unit tests — uses a mock `nn.Embedding` for `embed_tokens`.  
+**HF tokenizer required** for integration tests — same Qwen-2.5-0.5B tokenizer as Block 5.
+
+**Run tests:**
+```bash
+python tests/test_block6.py                   # unit + integration
+python tests/test_block6.py --skip-integration  # unit only (no HF call)
+```
+
+**Tests cover:** single-audio inference packing · multi-audio inference packing · Stage 1–3 training loss mask · Stage 4 CoT loss mask · audio tensor injection at correct positions · variable-length audio spans · `pack()` dispatch · attention mask shape · empty audio raises · batched `[1,T,896]` tensor handling · full Block4→Block5→Block6 chain (3 integration tests).
+
+**Output:** `PackedSequence` with `inputs_embeds [1, total_len, 896]`, `attention_mask`, `loss_mask` (1 only on assistant span), `audio_spans`, `prompt_len`, `target_len`.
+
+___
 
 ### Block 7 — Qwen-2.5-0.5B-Instruct (4-bit NF4 + QLoRA)
 
@@ -398,7 +420,7 @@ Larger encoders mean slower forward/backward passes than the Small+Base configur
 | Stage 4 | ~8 hours |
 | **Total** | **~33 hours** |
 
-Still within a single overnight+day run. The ~3.91 GB VRAM headroom allows batch sizes of 16–32 to keep training efficient.
+Still within a single overnight+day run. The ~4.42 GB VRAM headroom allows batch sizes of 16–32 to keep training efficient.
 
 ---
 
@@ -679,6 +701,6 @@ Still within a single overnight+day run. The ~3.91 GB VRAM headroom allows batch
 | Block 3 — Perceiver Resampler + Fusion | ✅ Complete | 16/16 passing |
 | Block 4 — MLP Adaptor | ✅ Complete | 43/43 passing |
 | Block 5 — Text Tokenizer | ✅ Complete | 65/65 passing |
-| Block 6 — Sequence Packing | 🔲 Pending | — |
+| Block 6 — Sequence Packing | ✅ Complete | 89/89 passing |
 | Block 7 — Qwen-2.5-0.5B LLM | 🔲 Pending | — |
 | Block 8 — Autoregressive Decoding | 🔲 Pending | — |
