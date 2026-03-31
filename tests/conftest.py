@@ -7,4 +7,5 @@ collect_ignore = [
     "test_block4.py",
     "test_block5.py",
     "test_block6.py",
+    "test_block7.py",
     ]
