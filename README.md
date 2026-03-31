@@ -313,7 +313,7 @@ ___
 | Q-heads | 14 (head_dim = 896 ÷ 14 = **64**) |
 | KV-heads | 2 (GQA ratio 7:1 — KV cache 7× smaller than MHA) |
 | FFN inner dim | 4864 (5.43× expansion) |
-| Vocabulary | 151,936 |
+| Vocabulary | 151,944 (151,936 base + 8 audio boundary tokens) |
 | Context window | 32,768 tokens (native) |
 | CoT | None native — must be trained in Stage 4 |
 
@@ -658,7 +658,7 @@ Still within a single overnight+day run. The ~4.42 GB VRAM headroom allows batch
 │       RMSNorm → SwiGLU FFN (896→4864→896) + Residual                     │
 │                                                                          │
 │  [7c] LM Head                                                            │
-│       RMSNorm → Linear(896 → 151936) → logits → softmax                  │
+│       RMSNorm → Linear(896 → 151944) → logits → softmax                  │
 │                                                                          │
 │  Flash Attention 2  ·  KV cache active in inference                      │
 │  4-bit NF4 base weights NEVER updated                                    │
@@ -701,5 +701,18 @@ Still within a single overnight+day run. The ~4.42 GB VRAM headroom allows batch
 | Block 4 — MLP Adaptor | ✅ Complete | 43/43 passing |
 | Block 5 — Text Tokenizer | ✅ Complete | 65/65 passing |
 | Block 6 — Sequence Packing | ✅ Complete | 89/89 passing |
-| Block 7 — Qwen-2.5-0.5B LLM | 🔲 Pending | — |
-| Block 8 — Autoregressive Decoding | 🔲 Pending | — |
+| Block 7 — Qwen-2.5-0.5B LLM | ✅ Complete | Full pipeline D7a/D7b/D7c passing |
+| Block 8 — Autoregressive Decoding | 🔲 Pending | Full pipeline D8 greedy decode passing |
+
+___
+
+## Full Pipeline Status
+
+✅ Full end-to-end pipeline test passes with real weights on CPU.
+
+Latest verified run:
+- 36 passed
+- 0 failed
+- Whisper: openai/whisper-medium
+- Qwen: Qwen-2.5-0.5B-Instruct
+- Includes: forward pass, training loss computation, autoregressive generation, and 3-token greedy decode
