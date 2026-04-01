@@ -374,12 +374,24 @@ RoPE (Rotary Positional Encoding) applied per-layer. 4-bit NF4 base weights are 
 | **Name** | Adaptor Alignment | Encoder Adaptation | Reasoning QLoRA | CoT Training + Multi-Audio |
 | **Trains** | MLP Adaptor, Perceiver Resampler, 64 queries | Whisper LoRA r=16, OpenBEATs LoRA r=16, Adaptor, Perceiver | QLoRA on LLM r=16, Adaptor, all LoRAs, Perceiver | QLoRA r=16, Adaptor, all LoRAs, Perceiver |
 | **Frozen** | Whisper, OpenBEATs, LLM (4-bit NF4) | LLM (4-bit NF4) | LLM base (4-bit) | LLM base (4-bit) |
-| **Data** | AudioCaps, ClothoV2, MusicCaps, ESC-50 QA | AudioCaps, MusicCaps, LibriSpeech, VoxCeleb, FSD-50K QA | AudioSkills, WavText5K, Custom MCQs | Synthetic CoT traces (~50k), multi-audio dialogue, AF-Chat pairs |
+| **Data** | AudioCaps, ClothoV2, MusicCaps, ESC-50 QA, **LibriSpeech (Speech)** | AudioCaps, MusicCaps, LibriSpeech, VoxCeleb, FSD-50K QA | AudioSkills, WavText5K, Custom MCQs, **Negative QA pairs** | Synthetic CoT traces (~50k), multi-audio dialogue, AF-Chat pairs |
 | **Loss** | CE on answer tokens only | CE on answer tokens only | CE on answer tokens only (no `<think>`) | CE on `<think>` span + answer span |
 | **Time** | ~3h | ~10h | ~12h | ~8h |
 | **Goal** | Bridge audio → 896-dim LLM space | 3-domain unified encoder repr. | Audio-grounded QA reasoning | On-demand CoT + multi-audio chat |
 
 All stages use: gradient checkpointing · bf16 mixed precision · AdamW · batch=16, grad_accum=4 (effective batch=64) · cosine LR decay.
+
+### Critical Dataset Formatting & Mixing Rules
+
+To prevent catastrophic forgetting and ensure the dual-encoder architecture learns to separate signals cleanly, the data pipeline must follow these rules:
+
+1. **Stage 1 Speech Alignment:** You must include pure speech (LibriSpeech) as simple transcription pairs (e.g., *Q: "What is the person saying?" A: "[Transcript]"*) so the untrained MLP Adaptor learns to route Whisper features alongside OpenBEATs features.
+2. **Separated → Mixed Audio Progression:** 
+   - **Stage 1:** Keep audio mostly isolated (pure speech, pure music, pure environmental sounds). This allows the blind MLP Adaptor to build a clean vocabulary without interference.
+   - **Stage 2+:** Heavily introduce mixed audio (e.g., overlapping speech and dog barks in AudioCaps) so the Whisper and OpenBEATs LoRAs learn how to filter interference and "share the mic."
+3. **Natural Language Tags:** Classification datasets (ESC-50, FSD-50K) must be wrapped in conversational templates. Never train the LLM on raw comma-separated tags (*Bad: "dog bark, outdoor"* | *Good: "I hear a dog barking outdoors."*).
+4. **Negative Examples:** Stage 3 must include negative QA pairs (e.g., *Q: "Is there a dog barking?" A: "No, there is no dog barking in this audio."*) to force the LLM to listen rather than hallucinate.
+5. **The Replay Buffer:** To prevent catastrophic forgetting of basic transcription and sound recognition, Stages 3 and 4 must include a ~20% "replay buffer" of the simpler datasets (LibriSpeech, AudioCaps) used in Stages 1 and 2.
 
 ### How CoT Traces Are Generated (Stage 4)
 
@@ -702,7 +714,7 @@ Still within a single overnight+day run. The ~4.42 GB VRAM headroom allows batch
 | Block 5 — Text Tokenizer | ✅ Complete | 65/65 passing |
 | Block 6 — Sequence Packing | ✅ Complete | 89/89 passing |
 | Block 7 — Qwen-2.5-0.5B LLM | ✅ Complete | Full pipeline D7a/D7b/D7c passing |
-| Block 8 — Autoregressive Decoding | 🔲 Pending | Full pipeline D8 greedy decode passing |
+| Block 8 — Autoregressive Decoding | ✅ Complete | Full pipeline D8 greedy decode passing |
 
 ___
 
