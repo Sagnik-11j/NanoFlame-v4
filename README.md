@@ -379,7 +379,7 @@ RoPE (Rotary Positional Encoding) applied per-layer. 4-bit NF4 base weights are 
 | **Time** | ~3h | ~10h | ~12h | ~8h |
 | **Goal** | Bridge audio → 896-dim LLM space | 3-domain unified encoder repr. | Audio-grounded QA reasoning | On-demand CoT + multi-audio chat |
 
-All stages use: gradient checkpointing · bf16 mixed precision · AdamW · batch=16, grad_accum=4 (effective batch=64) · cosine LR decay.
+All stages use: gradient checkpointing · bf16 mixed precision · AdamW · batch=32–64, grad_accum=1-2 (effective batch=64) · cosine LR decay.
 
 ### Critical Dataset Formatting & Mixing Rules
 
@@ -425,11 +425,11 @@ Larger encoders mean slower forward/backward passes than the Small+Base configur
 
 | Stage | Time |
 |---|---|
-| Stage 1 | ~3 hours |
-| Stage 2 | ~10 hours |
-| Stage 3 | ~12 hours |
-| Stage 4 | ~8 hours |
-| **Total** | **~33 hours** |
+| Stage 1 | ~45 mins |
+| Stage 2 | ~3 hours |
+| Stage 3 | ~4 hours |
+| Stage 4 | ~2 hours |
+| **Total** | **~10 hours** |
 
 Still within a single overnight+day run. The ~4.42 GB VRAM headroom allows batch sizes of 16–32 to keep training efficient.
 
