@@ -480,6 +480,132 @@ samples drawn in that stage.
 > CoT-to-direct ratio works well. Without this, the model will output `<think>` blocks 
 > for every single question at inference time.
 
+## Training Configuration Per Stage
+
+The following table specifies the exact optimizer settings, learning rates, and
+hyperparameters to use for each stage on an NVIDIA A100.
+
+| | Stage 1 | Stage 2 | Stage 3 | Stage 4 |
+|---|---|---|---|---|
+| **Optimizer** | AdamW | AdamW | AdamW | AdamW |
+| **Batch size (physical)** | 64 | 32 | 16 | 16 |
+| **Grad accumulation** | 1 | 2 | 4 | 4 |
+| **Effective batch size** | 64 | 64 | 64 | 64 |
+| **Block 3+4 LR** | `2e-4` | `1e-4` | `1e-4` | `5e-5` |
+| **Encoder LoRA LR** | N/A (frozen) | `5e-5` | `5e-5` | `3e-5` |
+| **Qwen QLoRA LR** | N/A (frozen) | N/A (frozen) | `2e-5` | `1e-5` |
+| **LR schedule** | Cosine decay | Cosine decay | Cosine decay | Cosine decay |
+| **Warmup steps** | 500 | 300 | 200 | 100 |
+| **Weight decay** | `1e-2` | `1e-2` | `1e-2` | `1e-2` |
+| **Gradient clip** | `1.0` | `1.0` | `1.0` | `0.5` |
+| **Precision** | bf16 | bf16 | bf16 | bf16 |
+| **Grad checkpointing** | ✅ | ✅ | ✅ | ✅ |
+| **Max sequence length** | 1024 tokens | 1536 tokens | 2048 tokens | 2048 tokens |
+| **Epochs** | 2 | 2 | 3 | 3 |
+
+> ⚠️ **Why gradient clip = 0.5 in Stage 4:** CoT targets are longer sequences.
+> Larger gradients are more common and can destabilize the QLoRA adapters if
+> unchecked. Lowering the clip from 1.0 → 0.5 keeps training stable.
+
+> ℹ️ **Why LRs decrease across stages:** Each stage inherits the weights from the
+> previous stage. Later stages require smaller updates to avoid overwriting what
+> was already learned. Stage 4 Qwen QLoRA uses `1e-5` (half of Stage 3) because
+> the CoT training target is very specific and aggressive updates will destroy
+> the general reasoning ability built in Stage 3.
+
+---
+
+## Checkpoint Strategy
+
+Each stage saves checkpoints that are loaded as the starting point for the next stage.
+The following files are produced and consumed across the 4-stage pipeline:
+
+
+
+**Checkpoint saving rule:** Save every 1000 steps + at end of each epoch.
+Use `save_best=True` based on validation loss to avoid saving a degraded checkpoint.
+
+**What each checkpoint contains:**
+- `stage1_final.pt` — Block 3 (Perceiver + Fusion) + Block 4 (MLP Adaptor) state dicts only. Encoder and LLM weights not saved (unchanged from pretrained).
+- `stage2_final.pt` — Block 3 + Block 4 + Whisper LoRA delta matrices + OpenBEATs LoRA delta matrices.
+- `stage3_final.pt` — Everything in stage2 + Qwen QLoRA adapter weights for all 24 decoder layers.
+- `stage4_final.pt` — Final deployable checkpoint. Load this for inference.
+
+---
+
+## Validation Strategy
+
+Run validation every 500 training steps. Track the following metrics per stage:
+
+| Stage | Primary Metric | Secondary Metric |
+|---|---|---|
+| Stage 1 | Caption BLEU-4 on AudioCaps val | CIDEr score |
+| Stage 2 | Caption BLEU-4 across 3 domains (speech/music/sound) | Per-domain loss |
+| Stage 3 | QA accuracy on held-out AudioSkills val set | Negative QA precision (no hallucinations) |
+| Stage 4 | QA accuracy with CoT trigger | `<think>` block F1 (reasoning quality) |
+
+**Early stopping:** If validation loss does not improve for 3 consecutive checkpoints
+(1500 steps), stop the stage and proceed to the next. Do not train past the point
+of diminishing returns.
+
+**Held-out validation sets (never seen during training):**
+- AudioCaps: official `val` split
+- AudioSkills: 10% held-out random split
+- ClothoV2: official `validation` split
+- LibriSpeech: `test-clean` split
+
+---
+
+## Why Base Weights Are Never Updated
+
+The base weights of Whisper-Medium (~300M), OpenBEATs-Large (~300M), and
+Qwen-2.5-0.5B (~500M) are frozen throughout all 4 stages. Only LoRA/QLoRA
+delta matrices and the bridge layers (Block 3 + Block 4) are trained.
+
+**Three reasons:**
+1. **Catastrophic forgetting prevention:** Whisper was trained on 680k hours.
+   Qwen was trained on 18 trillion tokens. Fine-tuning base weights on your
+   dataset (~1M samples) would overwrite this knowledge with a narrow distribution.
+2. **VRAM budget:** Full fine-tuning of all three models requires ~8–10 GB for
+   optimizer states alone, exceeding the 6 GB deployment target even on an A100
+   at large batch sizes.
+3. **LoRA sufficiency:** Weight updates during fine-tuning occupy a low-rank
+   subspace. LoRA (r=16) captures 95%+ of useful adaptation at ~1–2% of the
+   full parameter count. The result is mathematically equivalent to full fine-tuning
+   for this task scale.
+
+---
+
+## QA Wrapping for Classification Datasets
+
+Three datasets in your pipeline are classification datasets with raw labels,
+not natural language QA pairs. They must be wrapped before feeding into Block 5.
+
+**Affected datasets:** ESC-50 (Stage 1), FSD-50K (Stages 1+2), VGGSound (Stage 2).
+
+**Wrapping template:**
+```python
+QUESTION_TEMPLATES = [
+    "What sound is in this audio?",
+    "What can you hear in this recording?",
+    "Describe the sound in this audio clip.",
+    "What is making noise in this audio?",
+    "What type of sound does this audio contain?",
+    "Listen carefully. What do you hear?",
+]
+ANSWER_TEMPLATE = "I can hear {} in this audio."
+
+def wrap_classification_sample(sample, label_field="category"):
+    label = sample[label_field].replace("_", " ")
+    question = random.choice(QUESTION_TEMPLATES)
+    answer = ANSWER_TEMPLATE.format(f"a {label}")
+    return {"audio": sample["audio"], "question": question, "answer": answer}
+```
+
+> ⚠️ Never train on raw comma-separated tag strings like `"dog, outdoor, bark"`.
+> This will teach the LLM to output raw tags instead of natural language sentences,
+> permanently damaging Qwen's fluency.
+
 ---
 
 ## VRAM Budget
