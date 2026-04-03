@@ -374,10 +374,12 @@ RoPE (Rotary Positional Encoding) applied per-layer. 4-bit NF4 base weights are 
 | **Name** | Adaptor Alignment | Encoder Adaptation | Reasoning QLoRA | CoT Training + Multi-Audio |
 | **Trains** | MLP Adaptor, Perceiver Resampler, 64 queries | Whisper LoRA r=16, OpenBEATs LoRA r=16, Adaptor, Perceiver | QLoRA on LLM r=16, Adaptor, all LoRAs, Perceiver | QLoRA r=16, Adaptor, all LoRAs, Perceiver |
 | **Frozen** | Whisper, OpenBEATs, LLM (4-bit NF4) | LLM (4-bit NF4) | LLM base (4-bit) | LLM base (4-bit) |
-| **Data** | AudioCaps, ClothoV2, MusicCaps, ESC-50 QA, **LibriSpeech (Speech)** | AudioCaps, MusicCaps, LibriSpeech, VoxCeleb, FSD-50K QA | AudioSkills, WavText5K, Custom MCQs, **Negative QA pairs** | Synthetic CoT traces (~50k), multi-audio dialogue, AF-Chat pairs |
+| **Data** | WavCaps, AudioCaps, LibriSpeech, ClothoV2 (captions), MusicCaps, ESC-50 QA | VGGSound, FSD-50K QA, WavCaps, Mozilla Common Voice, Vox Celeb, MusicCaps | AudioSkills, Audio Reasoner, WavText5k, ClothoV2 (AQA/binary), long audio excel | AudioCoT Think (Alibaba), AF think, AF Chat |
 | **Loss** | CE on answer tokens only | CE on answer tokens only | CE on answer tokens only (no `<think>`) | CE on `<think>` span + answer span |
-| **Time** | ~3h | ~10h | ~12h | ~8h |
-| **Goal** | Bridge audio → 896-dim LLM space | 3-domain unified encoder repr. | Audio-grounded QA reasoning | On-demand CoT + multi-audio chat |
+| **Time** | ~45 mins (A100) | ~3 hours (A100) | ~4 hours (A100) | ~2 hours (A100) |
+| **Goal** | Bridge audio → 896-dim LLM space | 3-domain unified encoder repr. | Audio-grounded QA reasoning & long context | On-demand CoT + multi-audio chat |
+
+*(Note: Stages 3 and 4 include a 20% "Replay Buffer" sampled from Stage 1/2 datasets like Libri speech and Audiocaps to prevent catastrophic forgetting of basic transcription.)*
 
 All stages use: gradient checkpointing · bf16 mixed precision · AdamW · batch=32–64, grad_accum=1-2 (effective batch=64) · cosine LR decay.
 
@@ -400,6 +402,83 @@ To prevent catastrophic forgetting and ensure the dual-encoder architecture lear
    > *"Given this audio question and correct answer, write a short `<think>` block (40–60 words) that shows reasoning grounded in what you would observe in the audio spectrogram."*
 3. Use the generated `<think>` blocks as Stage 4 training targets
 4. Produces ~50k CoT-augmented examples cheaply
+
+### Dataset Mix Per Stage
+
+The following tables specify the exact dataset sampling strategy for each stage. 
+Percentages represent the proportion of each dataset relative to the total training 
+samples drawn in that stage.
+
+---
+
+#### Stage 1 — Adaptor Alignment (~700k total samples)
+
+| Dataset | % of Stage | Why |
+|---|---|---|
+| WavCaps | 30% | 400k ChatGPT-cleaned captions — massive vocabulary for the Adaptor |
+| AudioCaps | 20% | Gold-standard general sound captions |
+| LibriSpeech (20–30% subset) | 20% | Clean speech alignment for Whisper path — full dataset over-represents clean speech |
+| ClothoV2 (captions) | 10% | Rich, human-written environmental descriptions |
+| MusicCaps | 10% | Music domain coverage for OpenBEATs path |
+| ESC-50 QA (wrapped) | 5% | Simple classification baseline with QA wrapping |
+| FSD-50K QA (wrapped) | 5% | Extra sound class variety with QA wrapping |
+
+> ⚠️ **LibriSpeech Note:** Only use 20–30% of LibriSpeech here. Using the full 1000h 
+> dataset will over-represent clean studio speech and hurt noisy/accented speech 
+> performance later. Mozilla Common Voice in Stage 2 covers the noisy speech domain.
+
+---
+
+#### Stage 2 — Encoder Adaptation (~500k total samples)
+
+| Dataset | % of Stage | Why |
+|---|---|---|
+| VGGSound (full) | 30% | 200k in-the-wild clips across 310 classes — forces LoRAs to handle real-world noise |
+| FSD-50K QA (full) | 25% | Massive sound variety for OpenBEATs LoRA |
+| WavCaps (BBC/AudioSet subset) | 20% | Acoustically complex mixed audio |
+| Mozilla Common Voice (full) | 15% | Diverse noisy/accented speech — trains Whisper LoRA on real-world speech |
+| Vox Celeb (full) | 5% | Speaker identity — teaches Whisper to distinguish *who* is speaking |
+| MusicCaps (full) | 5% | Music LoRA refinement |
+
+> ℹ️ VGGSound and FSD-50K are classification datasets. Apply the same QA wrapping 
+> as ESC-50 before feeding into Block 5.
+
+---
+
+#### Stage 3 — Reasoning QLoRA (~100k total samples + 20% replay)
+
+| Dataset | % of Stage | Why |
+|---|---|---|
+| AudioSkills excel (full) | 25% | Multi-skill audio reasoning — the hardest QA in your dataset collection |
+| Audio Reasoner (full) | 20% | Structured audio QA reasoning, directly targets LLM QLoRA |
+| WavText5k (full) | 15% | Complex temporal and causal audio questions |
+| ClothoV2 AQA / binary (full) | 15% | Negative QA pairs — critical for teaching the model to say "No" |
+| Long audio excel (full) | 10% | Trains Block 3 multi-chunk positional encodings on real long audio |
+| Replay Buffer | 15% | 50% LibriSpeech + 50% AudioCaps sampled from Stage 1 to prevent catastrophic forgetting |
+
+> ⚠️ **ClothoV2 binary balance check:** Verify the Yes/No label ratio before training. 
+> If skewed, oversample the minority class to prevent the model from always answering "Yes."
+
+---
+
+#### Stage 4 — CoT Training + Multi-Audio (~80k total samples + 20% replay)
+
+| Dataset | % of Stage | Why |
+|---|---|---|
+| AudioCoT Think (Alibaba, full) | 35% | Audio-specific CoT annotations — richest reasoning source available |
+| AF think (full) | 25% | Ready-made Audio Flamingo CoT traces |
+| AF Chat (full) | 20% | Multi-turn, multi-audio conversational grounding |
+| Replay Buffer | 20% | 50% LibriSpeech + 50% AudioCaps sampled from Stage 1 |
+
+> ✅ **GPT-4o-mini NOT required:** With both AudioCoT Think (Alibaba) and AF think 
+> available, synthetic CoT generation via an external LLM is completely unnecessary. 
+> You have two independent, high-quality CoT sources already.
+
+> ⚠️ **CoT trigger discipline:** Ensure your Stage 4 training data is split between 
+> samples that use the trigger *"Think step by step before answering."* (which produce 
+> `<think>` outputs) and samples that do not (which produce direct answers). A 60/40 
+> CoT-to-direct ratio works well. Without this, the model will output `<think>` blocks 
+> for every single question at inference time.
 
 ---
 
