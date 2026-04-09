@@ -374,14 +374,12 @@ RoPE (Rotary Positional Encoding) applied per-layer. 4-bit NF4 base weights are 
 | **Name** | Adaptor Alignment | Encoder Adaptation | Reasoning QLoRA | CoT Training + Multi-Audio |
 | **Trains** | MLP Adaptor, Perceiver Resampler, 64 queries | Whisper LoRA r=16, OpenBEATs LoRA r=16, Adaptor, Perceiver | QLoRA on LLM r=16, Adaptor, all LoRAs, Perceiver | QLoRA r=16, Adaptor, all LoRAs, Perceiver |
 | **Frozen** | Whisper, OpenBEATs, LLM (4-bit NF4) | LLM (4-bit NF4) | LLM base (4-bit) | LLM base (4-bit) |
-| **Data** | WavCaps, AudioCaps, LibriSpeech, ClothoV2 (captions), MusicCaps, ESC-50 QA | VGGSound, FSD-50K QA, WavCaps, Mozilla Common Voice, Vox Celeb, MusicCaps | AudioSkills, Audio Reasoner, WavText5k, ClothoV2 (AQA/binary), long audio excel | AudioCoT Think (Alibaba), AF think, AF Chat |
+| **Data** | WavCaps, AudioCaps, LibriSpeech, JamendoMaxCaps, NSynth, ClothoV2, MusicCaps, ESC-50/FSD-50K | VGGSound, FSD-50K QA, WavCaps, Mozilla Common Voice, JamendoMaxCaps, Vox Celeb, MusicCaps | AudioSkills-XL, LongAudio-XL, WavText5k, ClothoV2 AQA/binary | AF-Think, Audio Reasoner CoTA, AF-Chat |
 | **Loss** | CE on answer tokens only | CE on answer tokens only | CE on answer tokens only (no `<think>`) | CE on `<think>` span + answer span |
 | **Time** | ~45 mins (A100) | ~3 hours (A100) | ~4 hours (A100) | ~2 hours (A100) |
 | **Goal** | Bridge audio → 896-dim LLM space | 3-domain unified encoder repr. | Audio-grounded QA reasoning & long context | On-demand CoT + multi-audio chat |
 
-*(Note: Stages 3 and 4 include a 20% "Replay Buffer" sampled from Stage 1/2 datasets like Libri speech and Audiocaps to prevent catastrophic forgetting of basic transcription.)*
-
-All stages use: gradient checkpointing · bf16 mixed precision · AdamW · batch=32–64, grad_accum=1-2 (effective batch=64) · cosine LR decay.
+*(Note: Stages 3 and 4 include a 15-20% "Replay Buffer" sampled from Stage 1/2 datasets like Libri speech and Audiocaps to prevent catastrophic forgetting of basic transcription.)*
 
 ### Critical Dataset Formatting & Mixing Rules
 
@@ -391,17 +389,9 @@ To prevent catastrophic forgetting and ensure the dual-encoder architecture lear
 2. **Separated → Mixed Audio Progression:** 
    - **Stage 1:** Keep audio mostly isolated (pure speech, pure music, pure environmental sounds). This allows the blind MLP Adaptor to build a clean vocabulary without interference.
    - **Stage 2+:** Heavily introduce mixed audio (e.g., overlapping speech and dog barks in AudioCaps) so the Whisper and OpenBEATs LoRAs learn how to filter interference and "share the mic."
-3. **Natural Language Tags:** Classification datasets (ESC-50, FSD-50K) must be wrapped in conversational templates. Never train the LLM on raw comma-separated tags (*Bad: "dog bark, outdoor"* | *Good: "I hear a dog barking outdoors."*).
+3. **Natural Language Tags:** Classification datasets (ESC-50, FSD-50K) and note datasets (NSynth) must be wrapped in conversational templates. Never train the LLM on raw comma-separated tags (*Bad: "dog bark, outdoor"* | *Good: "I hear a dog barking outdoors."*).
 4. **Negative Examples:** Stage 3 must include negative QA pairs (e.g., *Q: "Is there a dog barking?" A: "No, there is no dog barking in this audio."*) to force the LLM to listen rather than hallucinate.
-5. **The Replay Buffer:** To prevent catastrophic forgetting of basic transcription and sound recognition, Stages 3 and 4 must include a ~20% "replay buffer" of the simpler datasets (LibriSpeech, AudioCaps) used in Stages 1 and 2.
-
-### How CoT Traces Are Generated (Stage 4)
-
-1. Take the Stage 3 training set (correct Q+A pairs)
-2. Send each pair to GPT-4o-mini / Gemini Flash with the prompt:
-   > *"Given this audio question and correct answer, write a short `<think>` block (40–60 words) that shows reasoning grounded in what you would observe in the audio spectrogram."*
-3. Use the generated `<think>` blocks as Stage 4 training targets
-4. Produces ~50k CoT-augmented examples cheaply
+5. **The Replay Buffer:** To prevent catastrophic forgetting of basic transcription and sound recognition, Stages 3 and 4 must include a ~15-20% "replay buffer" of the simpler datasets (LibriSpeech, AudioCaps) used in Stages 1 and 2.
 
 ### Dataset Mix Per Stage
 
@@ -415,13 +405,14 @@ samples drawn in that stage.
 
 | Dataset | % of Stage | Why |
 |---|---|---|
-| WavCaps | 30% | 400k ChatGPT-cleaned captions — massive vocabulary for the Adaptor |
+| WavCaps | 25% | 400k ChatGPT-cleaned captions — massive vocabulary for the Adaptor |
 | AudioCaps | 20% | Gold-standard general sound captions |
 | LibriSpeech (20–30% subset) | 20% | Clean speech alignment for Whisper path — full dataset over-represents clean speech |
-| ClothoV2 (captions) | 10% | Rich, human-written environmental descriptions |
-| MusicCaps | 10% | Music domain coverage for OpenBEATs path |
-| ESC-50 QA (wrapped) | 5% | Simple classification baseline with QA wrapping |
-| FSD-50K QA (wrapped) | 5% | Extra sound class variety with QA wrapping |
+| JamendoMaxCaps | 15% | Massive boost for full-length instrumental music captioning |
+| ClothoV2 (captions) | 5% | Rich, human-written environmental descriptions |
+| MusicCaps | 5% | Extra music domain coverage for OpenBEATs path |
+| NSynth (wrapped) | 5% | Teaches fine-grained pitch and instrument discrimination |
+| ESC-50 / FSD-50K QA (wrapped) | 5% | Simple classification baseline with QA wrapping |
 
 > ⚠️ **LibriSpeech Note:** Only use 20–30% of LibriSpeech here. Using the full 1000h 
 > dataset will over-represent clean studio speech and hurt noisy/accented speech 
@@ -433,27 +424,27 @@ samples drawn in that stage.
 
 | Dataset | % of Stage | Why |
 |---|---|---|
-| VGGSound (full) | 30% | 200k in-the-wild clips across 310 classes — forces LoRAs to handle real-world noise |
+| VGGSound (full) | 25% | 200k in-the-wild clips across 310 classes — forces LoRAs to handle real-world noise |
 | FSD-50K QA (full) | 25% | Massive sound variety for OpenBEATs LoRA |
-| WavCaps (BBC/AudioSet subset) | 20% | Acoustically complex mixed audio |
+| WavCaps (BBC/AudioSet subset) | 15% | Acoustically complex mixed audio |
 | Mozilla Common Voice (full) | 15% | Diverse noisy/accented speech — trains Whisper LoRA on real-world speech |
+| JamendoMaxCaps | 10% | Trains OpenBEATs LoRA on complex musical structures and tempos |
 | Vox Celeb (full) | 5% | Speaker identity — teaches Whisper to distinguish *who* is speaking |
-| MusicCaps (full) | 5% | Music LoRA refinement |
+| MusicCaps (full) | 5% | Additional Music LoRA refinement |
 
 > ℹ️ VGGSound and FSD-50K are classification datasets. Apply the same QA wrapping 
 > as ESC-50 before feeding into Block 5.
 
 ---
 
-#### Stage 3 — Reasoning QLoRA (~100k total samples + 20% replay)
+#### Stage 3 — Reasoning QLoRA (~500k total samples + 15% replay)
 
 | Dataset | % of Stage | Why |
 |---|---|---|
-| AudioSkills excel (full) | 25% | Multi-skill audio reasoning — the hardest QA in your dataset collection |
-| Audio Reasoner (full) | 20% | Structured audio QA reasoning, directly targets LLM QLoRA |
+| AudioSkills-XL (5% sample) | 30% | Multi-skill audio reasoning — the hardest QA in your dataset collection |
+| LongAudio-XL (Temporal+Needle) | 25% | Trains Block 3 multi-chunk positional encodings on real long audio |
 | WavText5k (full) | 15% | Complex temporal and causal audio questions |
 | ClothoV2 AQA / binary (full) | 15% | Negative QA pairs — critical for teaching the model to say "No" |
-| Long audio excel (full) | 10% | Trains Block 3 multi-chunk positional encodings on real long audio |
 | Replay Buffer | 15% | 50% LibriSpeech + 50% AudioCaps sampled from Stage 1 to prevent catastrophic forgetting |
 
 > ⚠️ **ClothoV2 binary balance check:** Verify the Yes/No label ratio before training. 
@@ -461,18 +452,16 @@ samples drawn in that stage.
 
 ---
 
-#### Stage 4 — CoT Training + Multi-Audio (~80k total samples + 20% replay)
+#### Stage 4 — CoT Training + Multi-Audio (~600k total samples + 20% replay)
 
 | Dataset | % of Stage | Why |
 |---|---|---|
-| AudioCoT Think (Alibaba, full) | 35% | Audio-specific CoT annotations — richest reasoning source available |
-| AF think (full) | 25% | Ready-made Audio Flamingo CoT traces |
-| AF Chat (full) | 20% | Multi-turn, multi-audio conversational grounding |
+| AF-Think (full) | 40% | 500k ready-made Audio Flamingo CoT traces |
+| Audio Reasoner CoTA | 30% | 1.2M samples with ready-made `<THINK>` and `<PLANNING>` blocks |
+| AF-Chat (full) | 10% | Multi-turn, multi-audio conversational grounding |
 | Replay Buffer | 20% | 50% LibriSpeech + 50% AudioCaps sampled from Stage 1 |
 
-> ✅ **GPT-4o-mini NOT required:** With both AudioCoT Think (Alibaba) and AF think 
-> available, synthetic CoT generation via an external LLM is completely unnecessary. 
-> You have two independent, high-quality CoT sources already.
+> ✅ **GPT-4o-mini NOT required:** With AF-Think and Audio Reasoner CoTA available, synthetic CoT generation via an external LLM is completely unnecessary. 
 
 > ⚠️ **CoT trigger discipline:** Ensure your Stage 4 training data is split between 
 > samples that use the trigger *"Think step by step before answering."* (which produce 
